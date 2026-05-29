@@ -6,10 +6,7 @@ services:
     env_file:
       - .env
     volumes:
-      - proxy-data:/data
+      - ./data:/data
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
-
-volumes:
-  proxy-data:

@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Request
 
-from database import async_session
+import database as db_module
 from storage import store_listings_batch
 
 router = APIRouter()
@@ -15,6 +15,10 @@ async def get_inserate(
     min_price: int = None,
     max_price: int = None,
     page_count: int = 1,
+    category: str = None,
+    sort: str = None,
+    # JSON-encoded dict of category-specific filters; forwarded verbatim.
+    attribute_filters: str = None,
 ):
     client = request.app.state.upstream_client
 
@@ -29,13 +33,19 @@ async def get_inserate(
         params["min_price"] = min_price
     if max_price is not None:
         params["max_price"] = max_price
+    if category is not None:
+        params["category"] = category
+    if sort is not None:
+        params["sort"] = sort
+    if attribute_filters is not None:
+        params["attribute_filters"] = attribute_filters
     params["page_count"] = page_count
 
     response = await client.get("/inserate", params=params)
     data = response.json()
 
     if data.get("success") and data.get("results"):
-        async with async_session() as session:
+        async with db_module.async_session() as session:
             await store_listings_batch(session, data["results"], source="search")
 
     return data

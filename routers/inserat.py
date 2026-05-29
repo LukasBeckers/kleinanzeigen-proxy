@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Request
 
-from database import async_session
+import database as db_module
 from storage import store_listing
 
 router = APIRouter()
@@ -17,7 +17,7 @@ async def get_inserat(request: Request, listing_id: str):
     if data.get("success") and data.get("data"):
         listing_data = data["data"]
         adid = listing_data.get("id", listing_id)
-        async with async_session() as session:
+        async with db_module.async_session() as session:
             lid, version_id, is_new, image_urls = await store_listing(
                 session, listing_data, source="detail"
             )

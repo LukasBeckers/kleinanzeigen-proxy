@@ -196,3 +196,63 @@ async def store_listings_batch(
             results.append((adid, listing_id, version_id, image_urls))
     await session.commit()
     return results
+
+
+def _json_or(default, value):
+    if value is None or value == "":
+        return default
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError):
+        return default
+
+
+async def get_cached_detail(session: AsyncSession, adid: str) -> dict | None:
+    """Rebuild a ``/inserat/{id}.data`` shaped dict from the archive.
+
+    Returns ``None`` when we have no detail-source version for this adid
+    (i.e. we've only seen it via ``/inserate`` search cards, or never at
+    all).  The cache-hit marker is ``image_urls IS NOT NULL``, because
+    ``storage.py`` only populates it on ``source in {"detail", "combined"}``.
+
+    Caller is responsible for falling back to the live ``/inserat/{id}``
+    upstream call when this returns ``None``.
+    """
+    result = await session.execute(select(Listing).where(Listing.adid == adid))
+    listing = result.scalar_one_or_none()
+    if listing is None or listing.current_version_id is None:
+        return None
+
+    result = await session.execute(
+        select(ListingVersion).where(ListingVersion.id == listing.current_version_id)
+    )
+    v = result.scalar_one_or_none()
+    if v is None or v.image_urls is None:
+        # ``image_urls is None`` means the version was captured via the
+        # search-cards endpoint only — not a full detail fetch.
+        return None
+
+    return {
+        "id": adid,
+        "categories": _json_or([], v.categories),
+        "title": v.title or "",
+        "status": v.status or "active",
+        "price": {
+            "amount": v.price_amount,
+            "currency": v.price_currency or "€",
+            "negotiable": bool(v.price_negotiable) if v.price_negotiable is not None else False,
+        },
+        "delivery": v.delivery,
+        "location": {
+            "zip": v.location_zip or "",
+            "city": v.location_city or "",
+            "state": v.location_state or "",
+        },
+        "views": v.views or "0",
+        "description": v.description or "",
+        "images": _json_or([], v.image_urls),
+        "details": _json_or({}, v.details),
+        "features": _json_or([], v.features),
+        "seller": _json_or({}, v.seller),
+        "extra_info": _json_or({}, v.extra_info),
+    }
