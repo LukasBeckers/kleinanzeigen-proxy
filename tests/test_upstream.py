@@ -1,3 +1,5 @@
+import random
+
 import httpx
 import pytest
 
@@ -25,47 +27,14 @@ class TestLoadBalancedClient:
         await client.aclose()
 
     @pytest.mark.asyncio
-    async def test_retry_on_second_server_after_first_fails(self):
-        call_order = []
-
-        def handler_a(req: httpx.Request) -> httpx.Response:
-            call_order.append("a")
-            raise httpx.ConnectError("server a down")
-
-        def handler_b(req: httpx.Request) -> httpx.Response:
-            call_order.append("b")
-            return httpx.Response(200, json={"success": True})
+    async def test_raises_immediately_on_failure_no_cross_server_retry(self):
+        """With the new contract, a failure on the chosen server must raise immediately.
+        There is no fallback to other servers for the same request.
+        """
+        def handler(req: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("server down")
 
         urls = ["http://a:8000", "http://b:8000"]
-
-        client = LoadBalancedClient(urls, timeout=1.0)
-        client._clients["http://a:8000"] = httpx.AsyncClient(
-            base_url="http://a:8000",
-            transport=httpx.MockTransport(handler_a),
-        )
-        client._clients["http://b:8000"] = httpx.AsyncClient(
-            base_url="http://b:8000",
-            transport=httpx.MockTransport(handler_b),
-        )
-
-        import random
-        random.seed(0)
-
-        resp, upstream = await client.get("/inserate")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["success"] is True
-        assert upstream in client.urls
-        assert "b" in call_order
-
-        await client.aclose()
-
-    @pytest.mark.asyncio
-    async def test_raises_after_all_upstreams_fail(self):
-        def handler(req: httpx.Request) -> httpx.Response:
-            raise httpx.ConnectError("all down")
-
-        urls = ["http://a:8000", "http://b:8000", "http://c:8000"]
         client = LoadBalancedClient(urls, timeout=1.0)
         for url in urls:
             client._clients[url] = httpx.AsyncClient(
@@ -102,18 +71,17 @@ class TestLoadBalancedClient:
         await client.aclose()
 
     @pytest.mark.asyncio
-    async def test_all_urls_tried_after_partial_failures(self):
-        attempts: set[str] = set()
+    async def test_pure_random_distribution_over_many_calls(self):
+        """Over many calls, both servers should be chosen (pure random selection)."""
+        call_counts = {"http://a:8000": 0, "http://b:8000": 0}
 
         def make_handler(url: str):
-            async def h(req: httpx.Request) -> httpx.Response:
-                attempts.add(url)
-                if url == "http://c:8000":
-                    return httpx.Response(200, json={"success": True})
-                raise httpx.ConnectError(f"{url} down")
+            def h(req: httpx.Request) -> httpx.Response:
+                call_counts[url] += 1
+                return httpx.Response(200, json={"success": True})
             return h
 
-        urls = ["http://a:8000", "http://b:8000", "http://c:8000"]
+        urls = ["http://a:8000", "http://b:8000"]
         client = LoadBalancedClient(urls, timeout=1.0)
         for url in urls:
             client._clients[url] = httpx.AsyncClient(
@@ -121,12 +89,15 @@ class TestLoadBalancedClient:
                 transport=httpx.MockTransport(make_handler(url)),
             )
 
-        import random
-        random.seed(42)
+        random.seed(12345)  # for reproducibility
 
-        resp, upstream = await client.get("/inserate")
-        assert resp.status_code == 200
-        assert upstream in client.urls
-        assert "http://c:8000" in attempts
+        n_calls = 200
+        for _ in range(n_calls):
+            await client.get("/inserate")
+
+        # Both servers must have been chosen at least a few times.
+        assert call_counts["http://a:8000"] > 10
+        assert call_counts["http://b:8000"] > 10
+        assert call_counts["http://a:8000"] + call_counts["http://b:8000"] == n_calls
 
         await client.aclose()
