@@ -1,13 +1,13 @@
 import logging
 from contextlib import asynccontextmanager
 
-import httpx
 from fastapi import FastAPI
 
 from config import settings
 from database import init_db
 from image_worker import ImageWorker
 from routers import inserate, inserat, inserate_detailed
+from upstream import LoadBalancedClient
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -15,16 +15,13 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
-    logger.info(f"Connecting to upstream API at {settings.api_base_url}")
+    urls = settings.upstream_urls if hasattr(settings, "upstream_urls") else [settings.api_base_url]
+    logger.info(f"Connecting to upstream API(s): {', '.join(urls)}")
 
     await init_db()
     logger.info("Database initialized")
 
-    app.state.upstream_client = httpx.AsyncClient(
-        base_url=settings.api_base_url,
-        timeout=300.0,
-    )
+    app.state.upstream_client = LoadBalancedClient(urls, timeout=300.0)
 
     app.state.image_worker = ImageWorker()
     await app.state.image_worker.start()
@@ -46,8 +43,9 @@ app.include_router(inserate_detailed.router)
 
 @app.get("/")
 async def root():
+    upstreams = getattr(settings, "upstream_urls", [settings.api_base_url])
     return {
         "service": "kleinanzeigen-proxy",
-        "upstream": settings.api_base_url,
-        "endpoints": ["/inserate", "/inserat/{id}", "/inserate-detailed"],
+        "upstreams": upstreams,
+        "endpoints": ["/inserate", "/inserat/{id}", "/inserate-detailed", "/inserate-detailed-cached"],
     }

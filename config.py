@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     image_storage_path: str = "/data/images"
     image_download_concurrency: int = 5
 
-    model_config = SettingsConfigDict(env_file=".env")
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 
 settings = Settings()
