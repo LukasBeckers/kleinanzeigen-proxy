@@ -22,38 +22,29 @@ class LoadBalancedClient:
         return list(self._urls)
 
     async def get(self, path: str, *, params=None) -> tuple[httpx.Response, str]:
-        """Perform a GET against one of the upstreams (with failover).
+        """Perform a GET against a randomly chosen upstream.
 
         Returns (response, chosen_upstream_url) on success.
         The returned upstream URL can be used for visibility (e.g. X-Upstream-Used header).
 
-        Selection is deliberately pure random on every call (random.sample).
+        Selection is deliberately pure random on every call (random.choice).
         There is no stickiness or prioritization between servers — every request
-        (search or detail) is routed independently. Failover still works by trying
-        the remaining hosts in random order.
+        (search or detail) is routed independently to one server.
+
+        If the chosen server fails for this request, the error is raised immediately.
+        There is no retry or failover to other servers for the same request.
         """
-        order = random.sample(self._urls, len(self._urls))
-        last_exc: Exception | None = None
+        url = random.choice(self._urls)
+        client = self._clients[url]
 
-        for idx, url in enumerate(order):
-            client = self._clients[url]
-            try:
-                response = await client.get(path, params=params)
-                response.raise_for_status()
-                logger.info("Proxy using upstream %s for %s", url, path)
-                return response, url
-            except Exception as exc:
-                last_exc = exc
-                logger.warning(
-                    "Upstream %s failed for %s (attempt %d/%d): %s",
-                    url, path, idx + 1, len(order), exc,
-                )
-                continue
-
-        logger.error("All %d upstream(s) exhausted for %s", len(order), path)
-        if last_exc is not None:
-            raise last_exc
-        raise RuntimeError(f"All upstreams unavailable for {path}")
+        try:
+            response = await client.get(path, params=params)
+            response.raise_for_status()
+            logger.info("Proxy using upstream %s for %s", url, path)
+            return response, url
+        except Exception as exc:
+            logger.warning("Upstream %s failed for %s: %s", url, path, exc)
+            raise
 
     async def aclose(self):
         for client in self._clients.values():
