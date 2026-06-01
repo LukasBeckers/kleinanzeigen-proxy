@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    urls = settings.upstream_urls if hasattr(settings, "upstream_urls") else [settings.api_base_url]
+    urls = settings.upstream_urls
     logger.info(f"Connecting to upstream API(s): {', '.join(urls)}")
 
     await init_db()
@@ -43,9 +43,8 @@ app.include_router(inserate_detailed.router)
 
 @app.get("/")
 async def root():
-    upstreams = getattr(settings, "upstream_urls", [settings.api_base_url])
     return {
         "service": "kleinanzeigen-proxy",
-        "upstreams": upstreams,
+        "upstreams": settings.upstream_urls,
         "endpoints": ["/inserate", "/inserat/{id}", "/inserate-detailed", "/inserate-detailed-cached"],
     }
