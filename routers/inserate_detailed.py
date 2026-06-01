@@ -139,7 +139,11 @@ async def get_inserate_detailed_cached(
                 "performance_metrics": {"cache_hits": 0, "cache_misses": 0},
                 "error": search_data.get("error") or "upstream search failed",
             },
-            headers={"X-Upstream-Used": search_upstream},
+            headers={
+                "X-Upstream-Used": search_upstream,
+                "X-Cache-Hits": "0",
+                "X-Cache-Misses": "0",
+            },
         )
 
     cards = search_data.get("results") or []
@@ -242,6 +246,9 @@ async def get_inserate_detailed_cached(
             combined.append(row)
 
     # Response shape mirrors /inserate-detailed.
+    # For the cached variant we also expose cache effectiveness so callers
+    # (especially the hunter) can see how much came from local storage vs live
+    # upstream calls for this particular search.
     return JSONResponse(
         content={
             "success": True,
@@ -254,5 +261,9 @@ async def get_inserate_detailed_cached(
                 "pages_requested": page_count,
             },
         },
-        headers={"X-Upstream-Used": search_upstream},
+        headers={
+            "X-Upstream-Used": search_upstream,
+            "X-Cache-Hits": str(cache_hits),
+            "X-Cache-Misses": str(cache_misses),
+        },
     )
