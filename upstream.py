@@ -7,6 +7,8 @@ logger = logging.getLogger(__name__)
 
 
 class LoadBalancedClient:
+    _LOG_INTERVAL = 50  # Log distribution every N requests
+
     def __init__(self, urls: list[str], timeout: float = 300.0):
         self._urls = list(urls)
         self._clients: dict[str, httpx.AsyncClient] = {}
@@ -16,10 +18,25 @@ class LoadBalancedClient:
                 timeout=timeout,
             )
         self._timeout = timeout
+        self._request_counts: dict[str, int] = {url: 0 for url in self._urls}
+        self._total_requests = 0
 
     @property
     def urls(self) -> list[str]:
         return list(self._urls)
+
+    def _log_distribution(self):
+        if self._total_requests == 0:
+            return
+        parts = []
+        for url in self._urls:
+            count = self._request_counts.get(url, 0)
+            pct = (count / self._total_requests) * 100
+            parts.append(f"{url}: {count} ({pct:.1f}%)")
+        logger.info(
+            "Upstream usage distribution after %d requests: %s",
+            self._total_requests, " | ".join(parts)
+        )
 
     async def get(self, path: str, *, params=None) -> tuple[httpx.Response, str]:
         """Perform a GET against a randomly chosen upstream.
@@ -36,6 +53,12 @@ class LoadBalancedClient:
         """
         url = random.choice(self._urls)
         client = self._clients[url]
+
+        # Track usage for distribution logging
+        self._request_counts[url] += 1
+        self._total_requests += 1
+        if self._total_requests % self._LOG_INTERVAL == 0:
+            self._log_distribution()
 
         try:
             response = await client.get(path, params=params)
