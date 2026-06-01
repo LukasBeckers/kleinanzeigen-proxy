@@ -162,9 +162,9 @@ async def get_inserate_detailed_cached(
     cache_hits = 0
     cache_misses = 0
 
-    # 2. Partition + fill.
+    # 2. Partition using a short-lived session (only for cache lookups).
+    need_fetch: list[dict] = []
     async with db_module.async_session() as session:
-        need_fetch: list[dict] = []
         for card in cards:
             adid = str(card.get("adid") or "")
             if not adid:
@@ -178,14 +178,8 @@ async def get_inserate_detailed_cached(
                     "title": card.get("title"),
                     "price": card.get("price"),
                     "description": card.get("description"),
-                    # Card-level posted_at — fresh on every search, persists
-                    # through to hunter so it can age-filter and display.
                     "posted_at": card.get("posted_at"),
                     "posted_at_raw": card.get("posted_at_raw"),
-                    # Card-level location/distance — used by the hunter to
-                    # drop nationwide-fallback responses.  Always re-read
-                    # from the card (not the cache) since these are part
-                    # of the search result, not the listing detail.
                     "location_zip": card.get("location_zip"),
                     "location_city": card.get("location_city"),
                     "distance_km": card.get("distance_km"),
@@ -195,98 +189,90 @@ async def get_inserate_detailed_cached(
             else:
                 need_fetch.append(card)
 
-        # 3. Fetch detail for misses, store, and merge.
-        async def _fetch_one(card: dict) -> dict | None:
-            """
-            Fetch full detail for a cache-miss card.
+    # 3. Fetch details for misses — NO DB session is held during network I/O.
+    #    This prevents long-held connections when upstreams are slow.
+    attempted_misses = len(need_fetch)
+    successful_details = 0
+    failed_details = 0
 
-            We rely on LoadBalancedClient to try different upstream servers on failure
-            (pure random + failover on every .get() call).
+    to_store: list[tuple[dict, dict, str]] = []  # (card, detail, upstream_used)
 
-            If the request fails after the LB has exhausted all servers, we return None
-            (the card will not be included). We do NOT create partial cached records.
+    for card in need_fetch:
+        adid = str(card.get("adid") or "")
+        if not adid:
+            continue
 
-            No internal retries on the same server — if one server fails for this adid,
-            the next attempt (if any) will naturally go to another server via the LB.
-            """
-            adid = str(card.get("adid") or "")
-            if not adid:
-                return None
+        t0 = time.time()
 
-            t0 = time.time()
-
-            try:
-                response, upstream_used = await client.get(f"/inserat/{adid}")
-                data = response.json()
-            except Exception as exc:
-                # The LoadBalancedClient already tried multiple servers (pure random + failover).
-                logger.warning(
-                    "Detail fetch failed for adid=%s after exhausting available upstreams (error: %s)",
-                    adid, exc
-                )
-                return None
-
-            if not data.get("success") or not data.get("data"):
-                logger.warning(
-                    "Detail response not successful for adid=%s (success=%s, has_data=%s)",
-                    adid, data.get("success"), bool(data.get("data"))
-                )
-                return None
-
-            detail = data["data"]
-
-            lid, version_id, is_new, image_urls = await store_listing(
-                session, detail, source="detail"
-            )
-            if lid and version_id and image_urls:
-                await image_worker.create_pending_records(
-                    session, lid, version_id, image_urls
-                )
-            return {
-                "adid": adid,
-                "url": card.get("url"),
-                "title": card.get("title"),
-                "price": card.get("price"),
-                "description": card.get("description"),
-                "posted_at": card.get("posted_at"),
-                "posted_at_raw": card.get("posted_at_raw"),
-                "location_zip": card.get("location_zip"),
-                "location_city": card.get("location_city"),
-                "distance_km": card.get("distance_km"),
-                "details": detail,
-                "detail_fetch_time": round(time.time() - t0, 3),
-                "_detail_upstream": upstream_used,
-                "_enqueue": (lid, version_id, image_urls) if (lid and version_id and image_urls) else None,
-            }
-
-        # Sequential is fine — cache misses are the expensive step anyway
-        # and the upstream's own concurrency limiter protects against
-        # overloading the Playwright pool.
-        attempted_misses = len(need_fetch)
-        successful_details = 0
-        failed_details = 0
-
-        cache_misses = attempted_misses
-        fetched: list[dict] = []
-        for card in need_fetch:
-            row = await _fetch_one(card)
-            if row is not None:
-                fetched.append(row)
-                successful_details += 1
-            else:
-                failed_details += 1
-
-        if failed_details > 0:
+        try:
+            response, upstream_used = await client.get(f"/inserat/{adid}")
+            data = response.json()
+        except Exception as exc:
             logger.warning(
-                "Cached search failed to fetch full details for %d/%d cache-miss cards "
-                "(search_upstream=%s). These cards were dropped for this response. "
-                "Underlying API worker health for /inserat/{id} should be investigated.",
-                failed_details, attempted_misses, search_upstream,
+                "Detail fetch failed for adid=%s (upstream=%s, error: %s)",
+                adid, "unknown", exc
             )
+            failed_details += 1
+            continue
 
-        await session.commit()
+        if not data.get("success") or not data.get("data"):
+            logger.warning(
+                "Detail response not successful for adid=%s (success=%s, has_data=%s)",
+                adid, data.get("success"), bool(data.get("data"))
+            )
+            failed_details += 1
+            continue
 
-        # Enqueue image downloads after commit so workers see persisted rows.
+        detail = data["data"]
+        to_store.append((card, detail, upstream_used))
+        successful_details += 1
+
+    if failed_details > 0:
+        logger.warning(
+            "Cached search failed to fetch full details for %d/%d cache-miss cards "
+            "(search_upstream=%s). These cards were dropped for this response. "
+            "Underlying API worker health for /inserat/{id} should be investigated.",
+            failed_details, attempted_misses, search_upstream,
+        )
+
+    # 4. Store successful details using a fresh short-lived session.
+    #    Network work is already complete, so the session is only held for DB work.
+    cache_misses = attempted_misses
+    fetched: list[dict] = []
+
+    if to_store:
+        async with db_module.async_session() as session:
+            for card, detail, upstream_used in to_store:
+                t0 = time.time()  # re-measure only the store part if desired
+                lid, version_id, is_new, image_urls = await store_listing(
+                    session, detail, source="detail"
+                )
+                if lid and version_id and image_urls:
+                    await image_worker.create_pending_records(
+                        session, lid, version_id, image_urls
+                    )
+
+                row = {
+                    "adid": str(card.get("adid")),
+                    "url": card.get("url"),
+                    "title": card.get("title"),
+                    "price": card.get("price"),
+                    "description": card.get("description"),
+                    "posted_at": card.get("posted_at"),
+                    "posted_at_raw": card.get("posted_at_raw"),
+                    "location_zip": card.get("location_zip"),
+                    "location_city": card.get("location_city"),
+                    "distance_km": card.get("distance_km"),
+                    "details": detail,
+                    "detail_fetch_time": round(time.time() - t0, 3),
+                    "_detail_upstream": upstream_used,
+                    "_enqueue": (lid, version_id, image_urls) if (lid and version_id and image_urls) else None,
+                }
+                fetched.append(row)
+
+            await session.commit()
+
+        # Enqueue image downloads after commit.
         for row in fetched:
             enq = row.pop("_enqueue", None)
             if enq:
