@@ -42,7 +42,9 @@ async def get_inserate(
         params["attribute_filters"] = attribute_filters
     params["page_count"] = page_count
 
-    upstream_response, upstream_url = await client.get("/inserate", params=params)
+    upstream_response, upstream_url = await client.get_inserate_with_failover(
+        "/inserate", params=params
+    )
     data = upstream_response.json()
 
     if data.get("success") and data.get("results"):

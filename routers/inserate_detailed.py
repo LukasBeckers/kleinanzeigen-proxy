@@ -126,8 +126,10 @@ async def get_inserate_detailed_cached(
         query, location, radius, min_price, max_price, category, page_count, sort, attribute_filters
     )
 
-    # 1. Cheap search step.
-    search_resp, search_upstream = await client.get("/inserate", params=params)
+    # 1. Cheap search step (failover when an upstream returns success+empty).
+    search_resp, search_upstream = await client.get_inserate_with_failover(
+        "/inserate", params=params
+    )
     search_data = search_resp.json()
 
     raw_cards = len(search_data.get("results") or []) if search_data.get("success") else 0

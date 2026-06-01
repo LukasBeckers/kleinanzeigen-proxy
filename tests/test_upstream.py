@@ -1,9 +1,28 @@
 import random
+from unittest.mock import patch
 
 import httpx
 import pytest
 
-from upstream import LoadBalancedClient
+from upstream import LoadBalancedClient, is_degraded_inserate_search
+
+
+class TestDegradedSearchDetection:
+    def test_nonempty_results_not_degraded(self):
+        assert is_degraded_inserate_search({"success": True, "results": [{"adid": "1"}]}) is False
+
+    def test_success_empty_results_is_degraded(self):
+        assert is_degraded_inserate_search({"success": True, "results": []}) is True
+
+    def test_pages_successful_zero_is_degraded(self):
+        assert is_degraded_inserate_search({
+            "success": True,
+            "results": [],
+            "performance_metrics": {"pages_successful": 0},
+        }) is True
+
+    def test_failed_search_not_degraded_marker(self):
+        assert is_degraded_inserate_search({"success": False, "results": []}) is False
 
 
 class TestLoadBalancedClient:
@@ -99,5 +118,46 @@ class TestLoadBalancedClient:
         assert call_counts["http://a:8000"] > 10
         assert call_counts["http://b:8000"] > 10
         assert call_counts["http://a:8000"] + call_counts["http://b:8000"] == n_calls
+
+        await client.aclose()
+
+    @pytest.mark.asyncio
+    async def test_inserate_failover_skips_degraded_empty_upstream(self):
+        """First upstream returns success+empty; second returns cards."""
+        call_order: list[str] = []
+
+        def make_handler(url: str, payload: dict):
+            def h(req: httpx.Request) -> httpx.Response:
+                call_order.append(url)
+                return httpx.Response(200, json=payload)
+            return h
+
+        empty = {
+            "success": True,
+            "results": [],
+            "performance_metrics": {"pages_successful": 0},
+        }
+        good = {
+            "success": True,
+            "results": [{"adid": "99", "title": "Bike"}],
+            "performance_metrics": {"pages_successful": 1},
+        }
+
+        urls = ["http://a:8000", "http://b:8000"]
+        client = LoadBalancedClient(urls, timeout=1.0)
+        payloads = {"http://a:8000": empty, "http://b:8000": good}
+        for url in urls:
+            client._clients[url] = httpx.AsyncClient(
+                base_url=url,
+                transport=httpx.MockTransport(make_handler(url, payloads[url])),
+            )
+
+        # Deterministic order: try a (empty) then b (good).
+        with patch("upstream.random.shuffle", lambda urls: urls.sort()):
+            resp, upstream = await client.get_inserate_with_failover("/inserate")
+        data = resp.json()
+        assert len(data["results"]) == 1
+        assert upstream == "http://b:8000"
+        assert call_order == ["http://a:8000", "http://b:8000"]
 
         await client.aclose()
