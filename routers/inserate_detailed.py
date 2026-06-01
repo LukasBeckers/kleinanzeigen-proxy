@@ -1,3 +1,4 @@
+import logging
 import time
 
 from fastapi import APIRouter, Request
@@ -5,6 +6,8 @@ from fastapi.responses import JSONResponse
 
 import database as db_module
 from storage import get_cached_detail, store_listing, store_listings_batch
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -126,6 +129,13 @@ async def get_inserate_detailed_cached(
     # 1. Cheap search step.
     search_resp, search_upstream = await client.get("/inserate", params=params)
     search_data = search_resp.json()
+
+    raw_cards = len(search_data.get("results") or []) if search_data.get("success") else 0
+    logger.info(
+        "Cached search received %d raw cards from upstream=%s (params: %s)",
+        raw_cards, search_upstream, {k: v for k, v in params.items() if k in ("query", "category", "location", "radius")}
+    )
+
     if not search_data.get("success"):
         # Pass the upstream failure through — keep the response shape the
         # same as /inserate-detailed (``data`` key) so callers don't have
@@ -187,17 +197,42 @@ async def get_inserate_detailed_cached(
 
         # 3. Fetch detail for misses, store, and merge.
         async def _fetch_one(card: dict) -> dict | None:
+            """
+            Fetch full detail for a cache-miss card.
+
+            We rely on LoadBalancedClient to try different upstream servers on failure
+            (pure random + failover on every .get() call).
+
+            If the request fails after the LB has exhausted all servers, we return None
+            (the card will not be included). We do NOT create partial cached records.
+
+            No internal retries on the same server — if one server fails for this adid,
+            the next attempt (if any) will naturally go to another server via the LB.
+            """
             adid = str(card.get("adid") or "")
             if not adid:
                 return None
+
             t0 = time.time()
+
             try:
-                r = await client.get(f"/inserat/{adid}")
-                data = r.json()
-            except Exception:
+                response, upstream_used = await client.get(f"/inserat/{adid}")
+                data = response.json()
+            except Exception as exc:
+                # The LoadBalancedClient already tried multiple servers (pure random + failover).
+                logger.warning(
+                    "Detail fetch failed for adid=%s after exhausting available upstreams (error: %s)",
+                    adid, exc
+                )
                 return None
+
             if not data.get("success") or not data.get("data"):
+                logger.warning(
+                    "Detail response not successful for adid=%s (success=%s, has_data=%s)",
+                    adid, data.get("success"), bool(data.get("data"))
+                )
                 return None
+
             detail = data["data"]
 
             lid, version_id, is_new, image_urls = await store_listing(
@@ -220,21 +255,35 @@ async def get_inserate_detailed_cached(
                 "distance_km": card.get("distance_km"),
                 "details": detail,
                 "detail_fetch_time": round(time.time() - t0, 3),
-                # Carry enqueue info so we can kick off image downloads
-                # after the session commits.  Stripped before the response
-                # is returned.
+                "_detail_upstream": upstream_used,
                 "_enqueue": (lid, version_id, image_urls) if (lid and version_id and image_urls) else None,
             }
 
         # Sequential is fine — cache misses are the expensive step anyway
         # and the upstream's own concurrency limiter protects against
         # overloading the Playwright pool.
-        cache_misses = len(need_fetch)  # includes failed fetches, for observability
+        attempted_misses = len(need_fetch)
+        successful_details = 0
+        failed_details = 0
+
+        cache_misses = attempted_misses
         fetched: list[dict] = []
         for card in need_fetch:
             row = await _fetch_one(card)
             if row is not None:
                 fetched.append(row)
+                successful_details += 1
+            else:
+                failed_details += 1
+
+        if failed_details > 0:
+            logger.warning(
+                "Cached search failed to fetch full details for %d/%d cache-miss cards "
+                "(search_upstream=%s). These cards were dropped for this response. "
+                "Underlying API worker health for /inserat/{id} should be investigated.",
+                failed_details, attempted_misses, search_upstream,
+            )
+
         await session.commit()
 
         # Enqueue image downloads after commit so workers see persisted rows.
@@ -258,6 +307,11 @@ async def get_inserate_detailed_cached(
             "performance_metrics": {
                 "cache_hits": cache_hits,
                 "cache_misses": cache_misses,
+                "raw_cards_from_search": raw_cards,
+                "detail_fetch_attempts": attempted_misses,
+                "detail_fetch_successes": successful_details,
+                "detail_fetch_failures": failed_details,
+                "search_upstream": search_upstream,
                 "pages_requested": page_count,
             },
         },
@@ -265,5 +319,7 @@ async def get_inserate_detailed_cached(
             "X-Upstream-Used": search_upstream,
             "X-Cache-Hits": str(cache_hits),
             "X-Cache-Misses": str(cache_misses),
+            "X-Raw-Cards-From-Search": str(raw_cards),
+            "X-Detail-Failures": str(failed_details),
         },
     )

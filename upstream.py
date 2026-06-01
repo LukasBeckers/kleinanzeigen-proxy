@@ -27,8 +27,10 @@ class LoadBalancedClient:
         Returns (response, chosen_upstream_url) on success.
         The returned upstream URL can be used for visibility (e.g. X-Upstream-Used header).
 
-        Selection is deliberately neutral (random order each time) — no preference
-        for any particular server.
+        Selection is deliberately pure random on every call (random.sample).
+        There is no stickiness or prioritization between servers — every request
+        (search or detail) is routed independently. Failover still works by trying
+        the remaining hosts in random order.
         """
         order = random.sample(self._urls, len(self._urls))
         last_exc: Exception | None = None
