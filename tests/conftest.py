@@ -81,6 +81,9 @@ async def client(monkeypatch, engine, session_factory, upstream_handler) -> Asyn
             resp = await self._inner.get(path, params=params)
             return (resp, "http://mock-upstream")
 
+        async def get_inserate_with_failover(self, path="/inserate", *, params=None):
+            return await self.get(path, params=params)
+
         async def aclose(self):
             await self._inner.aclose()
 

@@ -190,12 +190,12 @@ class TestCachedEndpointDiagnostics:
         assert pm["raw_cards_from_search"] == 2
         assert body["unique_results"] == 2
 
-    async def test_cards_are_dropped_when_all_upstreams_fail_for_detail(self, client, router, upstream_handler):
+    async def test_cards_are_dropped_when_detail_fetch_fails(self, client, router, upstream_handler):
         """
-        When live detail fetches fail after the LoadBalancedClient has tried
-        all available upstreams, the cards are dropped (current design).
-        A clear warning is logged, and the failure is reflected in the metrics.
-        This matches the user's requirement to not create partial cached records.
+        When a live detail fetch fails (the chosen random upstream returns
+        an unsuccessful response), the card is dropped. A warning is logged
+        and the failure is reflected in the metrics.
+        This matches the requirement to not create partial cached records.
         """
         router.set_adids(["F1", "F2"])
 
