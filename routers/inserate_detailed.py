@@ -1,6 +1,7 @@
 import time
 
 from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
 
 import database as db_module
 from storage import get_cached_detail, store_listing, store_listings_batch
@@ -62,8 +63,8 @@ async def get_inserate_detailed(
     )
     params["max_concurrent_details"] = max_concurrent_details
 
-    response = await client.get("/inserate-detailed", params=params)
-    data = response.json()
+    upstream_response, upstream_url = await client.get("/inserate-detailed", params=params)
+    data = upstream_response.json()
 
     if data.get("success") and data.get("data"):
         async with db_module.async_session() as session:
@@ -80,7 +81,10 @@ async def get_inserate_detailed(
                 if version_id and image_urls:
                     image_worker.enqueue(adid, listing_id, version_id, image_urls)
 
-    return data
+    return JSONResponse(
+        content=data,
+        headers={"X-Upstream-Used": upstream_url},
+    )
 
 
 @router.get("/inserate-detailed-cached")
@@ -120,20 +124,23 @@ async def get_inserate_detailed_cached(
     )
 
     # 1. Cheap search step.
-    search_resp = await client.get("/inserate", params=params)
+    search_resp, search_upstream = await client.get("/inserate", params=params)
     search_data = search_resp.json()
     if not search_data.get("success"):
         # Pass the upstream failure through — keep the response shape the
         # same as /inserate-detailed (``data`` key) so callers don't have
         # to special-case.
-        return {
-            "success": False,
-            "data": [],
-            "unique_results": 0,
-            "time_taken": round(time.time() - t_start, 3),
-            "performance_metrics": {"cache_hits": 0, "cache_misses": 0},
-            "error": search_data.get("error") or "upstream search failed",
-        }
+        return JSONResponse(
+            content={
+                "success": False,
+                "data": [],
+                "unique_results": 0,
+                "time_taken": round(time.time() - t_start, 3),
+                "performance_metrics": {"cache_hits": 0, "cache_misses": 0},
+                "error": search_data.get("error") or "upstream search failed",
+            },
+            headers={"X-Upstream-Used": search_upstream},
+        )
 
     cards = search_data.get("results") or []
 
@@ -235,14 +242,17 @@ async def get_inserate_detailed_cached(
             combined.append(row)
 
     # Response shape mirrors /inserate-detailed.
-    return {
-        "success": True,
-        "data": combined,
-        "unique_results": len(combined),
-        "time_taken": round(time.time() - t_start, 3),
-        "performance_metrics": {
-            "cache_hits": cache_hits,
-            "cache_misses": cache_misses,
-            "pages_requested": page_count,
+    return JSONResponse(
+        content={
+            "success": True,
+            "data": combined,
+            "unique_results": len(combined),
+            "time_taken": round(time.time() - t_start, 3),
+            "performance_metrics": {
+                "cache_hits": cache_hits,
+                "cache_misses": cache_misses,
+                "pages_requested": page_count,
+            },
         },
-    }
+        headers={"X-Upstream-Used": search_upstream},
+    )

@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
 
 import database as db_module
 from storage import store_listing
@@ -11,8 +12,8 @@ async def get_inserat(request: Request, listing_id: str):
     client = request.app.state.upstream_client
     image_worker = request.app.state.image_worker
 
-    response = await client.get(f"/inserat/{listing_id}")
-    data = response.json()
+    upstream_response, upstream_url = await client.get(f"/inserat/{listing_id}")
+    data = upstream_response.json()
 
     if data.get("success") and data.get("data"):
         listing_data = data["data"]
@@ -30,4 +31,7 @@ async def get_inserat(request: Request, listing_id: str):
             if lid and version_id and image_urls:
                 image_worker.enqueue(adid, lid, version_id, image_urls)
 
-    return data
+    return JSONResponse(
+        content=data,
+        headers={"X-Upstream-Used": upstream_url},
+    )
