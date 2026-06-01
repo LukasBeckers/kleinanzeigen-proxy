@@ -65,11 +65,26 @@ async def client(monkeypatch, engine, session_factory, upstream_handler) -> Asyn
     # Prevent real startup (which would try to reach host.docker.internal:8000)
     def _handler(req: httpx.Request) -> httpx.Response:
         return upstream_handler.handler(req)
-    mock_upstream = httpx.AsyncClient(
+
+    real_mock = httpx.AsyncClient(
         base_url="http://upstream",
         transport=httpx.MockTransport(_handler),
         timeout=30.0,
     )
+
+    class _TupleReturningClient:
+        """Adapter so tests see the same (response, upstream) interface as production."""
+        def __init__(self, inner):
+            self._inner = inner
+
+        async def get(self, path, *, params=None):
+            resp = await self._inner.get(path, params=params)
+            return (resp, "http://mock-upstream")
+
+        async def aclose(self):
+            await self._inner.aclose()
+
+    mock_upstream = _TupleReturningClient(real_mock)
 
     class _NoopImageWorker:
         queue = None
@@ -85,4 +100,4 @@ async def client(monkeypatch, engine, session_factory, upstream_handler) -> Asyn
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://testproxy") as ac:
         yield ac
-    await mock_upstream.aclose()
+    await real_mock.aclose()

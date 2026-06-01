@@ -169,3 +169,53 @@ class TestCachedEndpoint:
         )
         assert body["performance_metrics"]["cache_misses"] == 1
         assert router.inserat_calls == 1
+
+
+class TestCachedEndpointDiagnostics:
+    """Tests for the new diagnostic fields added to /inserate-detailed-cached."""
+
+    async def test_diagnostic_fields_present_on_success(self, client, router, upstream_handler):
+        """When the search succeeds, the new diagnostic fields must be present."""
+        router.set_adids(["D1", "D2"])
+        r = await client.get("/inserate-detailed-cached", params={"query": "test"})
+        body = r.json()
+
+        pm = body["performance_metrics"]
+        assert "raw_cards_from_search" in pm
+        assert "detail_fetch_attempts" in pm
+        assert "detail_fetch_successes" in pm
+        assert "detail_fetch_failures" in pm
+        assert "search_upstream" in pm
+
+        assert pm["raw_cards_from_search"] == 2
+        assert body["unique_results"] == 2
+
+    async def test_cards_are_dropped_when_all_upstreams_fail_for_detail(self, client, router, upstream_handler):
+        """
+        When live detail fetches fail after the LoadBalancedClient has tried
+        all available upstreams, the cards are dropped (current design).
+        A clear warning is logged, and the failure is reflected in the metrics.
+        This matches the user's requirement to not create partial cached records.
+        """
+        router.set_adids(["F1", "F2"])
+
+        # Make detail fetches fail for these adids
+        original_handle = router.handle
+
+        def failing_detail(req: httpx.Request) -> httpx.Response:
+            if req.url.path.startswith("/inserat/"):
+                return httpx.Response(200, json={"success": False, "data": None})
+            return original_handle(req)
+
+        upstream_handler.handler = failing_detail
+
+        r = await client.get("/inserate-detailed-cached", params={"query": "failtest"})
+        body = r.json()
+
+        # Cards are dropped when all upstreams fail for the detail
+        assert body["unique_results"] == 0
+        assert len(body["data"]) == 0
+
+        pm = body["performance_metrics"]
+        assert pm["detail_fetch_failures"] == 2
+        assert pm["detail_fetch_successes"] == 0
