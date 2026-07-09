@@ -32,6 +32,7 @@ Three tables form the storage layer:
 | `first_seen_at` | DATETIME | When the listing was first encountered |
 | `last_seen_at` | DATETIME | Updated on every fetch (even without changes) |
 | `current_version_id` | TEXT (FK) | Points to the latest version |
+| `has_detail` | BOOLEAN | True when `current_version_id` is a full detail snapshot (not search-card only) |
 
 **`listing_versions`** - A new row is created only when listing content changes.
 
@@ -57,6 +58,7 @@ Three tables form the storage layer:
 | `extra_info` | TEXT (JSON) | Additional metadata |
 | `image_urls` | TEXT (JSON) | Original image URLs at time of fetch |
 | `data_hash` | TEXT | SHA256 hash for deduplication |
+| `is_detail` | BOOLEAN | True when this version came from a full `/inserat/{id}` (or equivalent) fetch |
 
 **`images`** - One row per downloaded image file.
 
@@ -191,7 +193,7 @@ curl "http://localhost:8001/inserate-detailed-cached?query=mofa&location=52538&r
 
 The JSON body includes `performance_metrics` with `cache_hits`, `cache_misses`, `raw_cards_from_search`, and `search_upstream`. These measure **proxy-level** detail caching only.
 
-Detail cache hits require a full `/inserat/{id}` snapshot in SQLite, not just a search card from `/inserate`. Search-only rows leave `image_urls`, `seller`, and `status` unset; detail rows always set them (including `image_urls = "[]"` when a listing has no photos) so imageless listings are cached after the first detail fetch and do not trigger repeat upstream navigations.
+Detail cache hits require `listings.has_detail = true` (current version has `is_detail = true`). Search-card archival from `GET /inserate` stores versions with `is_detail = false`; only full detail fetches flip the flags. Imageless listings are cached after the first detail fetch (`image_urls = "[]"`).
 
 **Note for kleinanzeigen-hunter consumers:** `cache_hits` / `cache_misses` are unrelated to hunter's `new_count`. A run can scrape 25 listings (23 cache hits, 2 misses) yet show `new_count=0` when every adid was already seen by that job's `seen_listings` dedup. Cache hits mean "detail came from proxy storage"; `new_count` means "adid not yet processed under this job's pipeline hash".
 

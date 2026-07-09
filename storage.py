@@ -9,23 +9,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from models import Listing, ListingVersion, new_uuid, utcnow
 
 
+def _source_is_detail(source: str) -> bool:
+    """Whether *source* represents a full listing page (not a search card)."""
+    return source in {"detail", "combined"}
+
+
 def _detail_image_urls(images) -> str:
-    """Persist gallery URLs for detail/combined fetches.
-
-    Search-card storage leaves ``image_urls`` NULL so ``get_cached_detail``
-    can tell search-only rows apart.  Detail fetches always set this column —
-    including ``"[]"`` when the listing has no photos — so imageless listings
-    still count as cache hits and avoid repeat upstream navigations.
-    """
+    """Persist gallery URLs for detail/combined fetches (``[]`` when empty)."""
     return json.dumps(images if images is not None else [])
-
-
-def _version_has_detail(v: ListingVersion) -> bool:
-    """True when *v* holds a full detail snapshot, not a search card only."""
-    if v.image_urls is not None:
-        return True
-    # Legacy rows: detail was stored before empty galleries wrote ``"[]"``.
-    return v.seller is not None or v.status is not None
 
 
 def _extract_version_fields(data: dict, source: str) -> dict:
@@ -131,6 +122,7 @@ async def store_listing(
         return None, None, False, []
 
     fields = _extract_version_fields(data, source)
+    is_detail = _source_is_detail(source)
     data_hash = _compute_hash(fields)
     now = utcnow()
 
@@ -153,6 +145,7 @@ async def store_listing(
                 first_seen_at=now,
                 last_seen_at=now,
                 current_version_id=version_id,
+                has_detail=is_detail,
             )
             .on_conflict_do_nothing(index_elements=["adid"])
         )
@@ -163,6 +156,7 @@ async def store_listing(
                 listing_id=listing_id,
                 fetched_at=now,
                 data_hash=data_hash,
+                is_detail=is_detail,
                 **fields,
             )
             session.add(version)
@@ -197,9 +191,11 @@ async def store_listing(
         listing_id=listing.id,
         fetched_at=now,
         data_hash=data_hash,
+        is_detail=is_detail,
         **fields,
     )
     listing.current_version_id = version_id
+    listing.has_detail = is_detail
     session.add(version)
     await session.flush()
     return listing.id, version_id, True, image_urls
@@ -235,25 +231,23 @@ def _json_or(default, value):
 async def get_cached_detail(session: AsyncSession, adid: str) -> dict | None:
     """Rebuild a ``/inserat/{id}.data`` shaped dict from the archive.
 
-    Returns ``None`` when we have no detail-source version for this adid
-    (i.e. we've only seen it via ``/inserate`` search cards, or never at
-    all).  Search-only rows keep ``image_urls``, ``seller``, and ``status``
-    unset; detail rows always set ``image_urls`` (``"[]"`` when there are
-    no photos) and populate seller/status.
+    Returns ``None`` when we have no detail snapshot for this adid (search-card
+    archival only, or never stored).  Uses ``listings.has_detail`` and the
+    current version's ``is_detail`` flag — not field presence heuristics.
 
     Caller is responsible for falling back to the live ``/inserat/{id}``
     upstream call when this returns ``None``.
     """
     result = await session.execute(select(Listing).where(Listing.adid == adid))
     listing = result.scalar_one_or_none()
-    if listing is None or listing.current_version_id is None:
+    if listing is None or not listing.has_detail or listing.current_version_id is None:
         return None
 
     result = await session.execute(
         select(ListingVersion).where(ListingVersion.id == listing.current_version_id)
     )
     v = result.scalar_one_or_none()
-    if v is None or not _version_has_detail(v):
+    if v is None or not v.is_detail:
         return None
 
     return {

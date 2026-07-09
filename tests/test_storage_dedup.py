@@ -152,6 +152,8 @@ class TestImagelessDetailCaching:
             assert cached["images"] == []
 
         async with session_factory() as s:
+            listing = (await s.execute(select(Listing).where(Listing.adid == "img0"))).scalar_one()
+            assert listing.has_detail is True
             v = (
                 await s.execute(
                     select(ListingVersion)
@@ -159,7 +161,28 @@ class TestImagelessDetailCaching:
                     .where(Listing.adid == "img0")
                 )
             ).scalar_one()
+            assert v.is_detail is True
             assert v.image_urls == "[]"
+
+
+class TestDetailFlags:
+    async def test_search_version_is_not_detail(self, session_factory):
+        async with session_factory() as s:
+            await storage.store_listing(s, _search_result("sf1"), source="search")
+            await s.commit()
+
+        async with session_factory() as s:
+            listing = (await s.execute(select(Listing).where(Listing.adid == "sf1"))).scalar_one()
+            assert listing.has_detail is False
+            v = (
+                await s.execute(
+                    select(ListingVersion)
+                    .join(Listing, Listing.id == ListingVersion.listing_id)
+                    .where(Listing.adid == "sf1")
+                )
+            ).scalar_one()
+            assert v.is_detail is False
+            assert await storage.get_cached_detail(s, "sf1") is None
 
 
 class TestViewsExcludedFromHash:
