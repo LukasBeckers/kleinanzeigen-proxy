@@ -126,6 +126,42 @@ class TestConcurrentInsertRace:
             assert len(listings) == 1
 
 
+class TestImagelessDetailCaching:
+    async def test_empty_gallery_stored_as_json_array(self, session_factory):
+        detail = {
+            "id": "img0",
+            "title": "No photos",
+            "description": "Still a full detail fetch",
+            "url": "https://ka.de/x/img0",
+            "status": "active",
+            "price": {"amount": "50", "currency": "€", "negotiable": False},
+            "views": "3",
+            "images": [],
+            "details": {},
+            "features": [],
+            "seller": {"name": "seller"},
+            "extra_info": {},
+        }
+        async with session_factory() as s:
+            await storage.store_listing(s, detail, source="detail")
+            await s.commit()
+
+        async with session_factory() as s:
+            cached = await storage.get_cached_detail(s, "img0")
+            assert cached is not None
+            assert cached["images"] == []
+
+        async with session_factory() as s:
+            v = (
+                await s.execute(
+                    select(ListingVersion)
+                    .join(Listing, Listing.id == ListingVersion.listing_id)
+                    .where(Listing.adid == "img0")
+                )
+            ).scalar_one()
+            assert v.image_urls == "[]"
+
+
 class TestViewsExcludedFromHash:
     async def test_views_bump_alone_does_not_create_version(self, session_factory):
         """``views`` changes every hour — including it in the hash would

@@ -9,6 +9,25 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from models import Listing, ListingVersion, new_uuid, utcnow
 
 
+def _detail_image_urls(images) -> str:
+    """Persist gallery URLs for detail/combined fetches.
+
+    Search-card storage leaves ``image_urls`` NULL so ``get_cached_detail``
+    can tell search-only rows apart.  Detail fetches always set this column —
+    including ``"[]"`` when the listing has no photos — so imageless listings
+    still count as cache hits and avoid repeat upstream navigations.
+    """
+    return json.dumps(images if images is not None else [])
+
+
+def _version_has_detail(v: ListingVersion) -> bool:
+    """True when *v* holds a full detail snapshot, not a search card only."""
+    if v.image_urls is not None:
+        return True
+    # Legacy rows: detail was stored before empty galleries wrote ``"[]"``.
+    return v.seller is not None or v.status is not None
+
+
 def _extract_version_fields(data: dict, source: str) -> dict:
     """Extract version fields from either a search result or a detail result."""
     fields = {
@@ -58,7 +77,7 @@ def _extract_version_fields(data: dict, source: str) -> dict:
         fields["features"] = json.dumps(data.get("features")) if data.get("features") else None
         fields["seller"] = json.dumps(data.get("seller")) if data.get("seller") else None
         fields["extra_info"] = json.dumps(data.get("extra_info")) if data.get("extra_info") else None
-        fields["image_urls"] = json.dumps(data.get("images")) if data.get("images") else None
+        fields["image_urls"] = _detail_image_urls(data.get("images"))
     elif source == "combined":
         # Combined endpoint: top-level has search fields, "details" has detail fields
         detail = data.get("details", {}) or {}
@@ -87,7 +106,7 @@ def _extract_version_fields(data: dict, source: str) -> dict:
         fields["features"] = json.dumps(detail.get("features")) if detail.get("features") else None
         fields["seller"] = json.dumps(detail.get("seller")) if detail.get("seller") else None
         fields["extra_info"] = json.dumps(detail.get("extra_info")) if detail.get("extra_info") else None
-        fields["image_urls"] = json.dumps(detail.get("images")) if detail.get("images") else None
+        fields["image_urls"] = _detail_image_urls(detail.get("images"))
 
     return fields
 
@@ -119,12 +138,7 @@ async def store_listing(
     result = await session.execute(select(Listing).where(Listing.adid == adid))
     listing = result.scalar_one_or_none()
 
-    image_urls = []
-    if fields.get("image_urls"):
-        try:
-            image_urls = json.loads(fields["image_urls"])
-        except (json.JSONDecodeError, TypeError):
-            pass
+    image_urls = _json_or([], fields.get("image_urls"))
 
     if listing is None:
         # INSERT OR IGNORE avoids 500s when concurrent cache misses race on the
@@ -223,8 +237,9 @@ async def get_cached_detail(session: AsyncSession, adid: str) -> dict | None:
 
     Returns ``None`` when we have no detail-source version for this adid
     (i.e. we've only seen it via ``/inserate`` search cards, or never at
-    all).  The cache-hit marker is ``image_urls IS NOT NULL``, because
-    ``storage.py`` only populates it on ``source in {"detail", "combined"}``.
+    all).  Search-only rows keep ``image_urls``, ``seller``, and ``status``
+    unset; detail rows always set ``image_urls`` (``"[]"`` when there are
+    no photos) and populate seller/status.
 
     Caller is responsible for falling back to the live ``/inserat/{id}``
     upstream call when this returns ``None``.
@@ -238,9 +253,7 @@ async def get_cached_detail(session: AsyncSession, adid: str) -> dict | None:
         select(ListingVersion).where(ListingVersion.id == listing.current_version_id)
     )
     v = result.scalar_one_or_none()
-    if v is None or v.image_urls is None:
-        # ``image_urls is None`` means the version was captured via the
-        # search-cards endpoint only — not a full detail fetch.
+    if v is None or not _version_has_detail(v):
         return None
 
     return {

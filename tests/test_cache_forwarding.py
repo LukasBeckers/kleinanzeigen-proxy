@@ -147,6 +147,37 @@ class TestCachedEndpoint:
         assert body["performance_metrics"]["cache_misses"] == 2
         assert router.inserat_calls == 2, "only the two new adids go through the detail fetch"
 
+    async def test_imageless_detail_counts_as_hit_on_second_request(
+        self, client, router, session_factory, upstream_handler
+    ):
+        """Listings with no photos must still be cached after the first detail fetch."""
+        adid = "Z0"
+        inserat_calls = 0
+
+        def handle(req: httpx.Request) -> httpx.Response:
+            nonlocal inserat_calls
+            path = req.url.path
+            if path == "/inserate":
+                return _search_response([adid])
+            if path == f"/inserat/{adid}":
+                inserat_calls += 1
+                return _detail_response(adid, images=[])
+            return httpx.Response(404, json={"error": f"unhandled {path}"})
+
+        upstream_handler.handler = handle
+
+        first = await client.get("/inserate-detailed-cached", params={"query": "mofa"})
+        assert first.json()["performance_metrics"]["cache_misses"] == 1
+        assert inserat_calls == 1
+
+        inserat_calls = 0
+        second = await client.get("/inserate-detailed-cached", params={"query": "mofa"})
+        body = second.json()
+        assert body["performance_metrics"]["cache_hits"] == 1
+        assert body["performance_metrics"]["cache_misses"] == 0
+        assert inserat_calls == 0
+        assert body["data"][0]["details"]["images"] == []
+
     async def test_search_only_version_counts_as_miss(self, client, router, session_factory, upstream_handler):
         """If the only thing we've ever stored about an adid is a search
         card (no detail), it must NOT be treated as a cache hit — otherwise
