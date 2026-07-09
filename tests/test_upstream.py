@@ -69,9 +69,11 @@ class TestLoadBalancedClient:
         await client.aclose()
 
     @pytest.mark.asyncio
-    async def test_cold_start_first_pick_is_uniform(self):
-        """Before any attempts, selection is uniform random."""
+    async def test_optimistic_prior_splits_evenly_before_real_outcomes(self):
+        """Pre-filled success histories give ~50/50 before any live traffic."""
         client = LoadBalancedClient(["http://a:8000", "http://b:8000"], timeout=1.0)
+        assert client._success_count("http://a:8000") == 100
+        assert client._success_count("http://b:8000") == 100
         random.seed(1)
         picks = [client._pick_upstream() for _ in range(1000)]
         a = picks.count("http://a:8000")
@@ -163,7 +165,48 @@ class TestLoadBalancedClient:
         with pytest.raises(httpx.ConnectError):
             await client.get("/inserate")
 
-        assert list(client._outcomes["http://a:8000"]) == [False]
-        assert client._success_count("http://a:8000") == 0
+        outcomes = list(client._outcomes["http://a:8000"])
+        assert outcomes[-1] is False
+        assert outcomes.count(False) == 1
+        assert client._success_count("http://a:8000") == 99
+
+        await client.aclose()
+
+    @pytest.mark.asyncio
+    async def test_single_failure_does_not_starve_upstream(self):
+        """One failure must not drop an upstream from ~equal share immediately."""
+        call_counts = {"http://a:8000": 0, "http://b:8000": 0}
+
+        def handler_a(req: httpx.Request) -> httpx.Response:
+            call_counts["http://a:8000"] += 1
+            return httpx.Response(200, json={"success": True})
+
+        def handler_b(req: httpx.Request) -> httpx.Response:
+            call_counts["http://b:8000"] += 1
+            if call_counts["http://b:8000"] == 1:
+                raise httpx.ConnectError("transient")
+            return httpx.Response(200, json={"success": True})
+
+        urls = ["http://a:8000", "http://b:8000"]
+        client = LoadBalancedClient(urls, timeout=1.0, history_size=100)
+        client._clients["http://a:8000"] = httpx.AsyncClient(
+            base_url="http://a:8000",
+            transport=httpx.MockTransport(handler_a),
+        )
+        client._clients["http://b:8000"] = httpx.AsyncClient(
+            base_url="http://b:8000",
+            transport=httpx.MockTransport(handler_b),
+        )
+
+        random.seed(42)
+        for _ in range(200):
+            try:
+                await client.get("/inserate")
+            except httpx.ConnectError:
+                pass
+
+        b_share = call_counts["http://b:8000"] / 200
+        assert b_share > 0.25
+        assert call_counts["http://a:8000"] + call_counts["http://b:8000"] <= 200
 
         await client.aclose()

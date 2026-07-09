@@ -114,7 +114,7 @@ Multiple upstream API workers can be configured via `API_BASE_URLS` (comma-separ
 
 - Each upstream keeps the last **100** attempt outcomes (HTTP 2xx = success, anything else = failure).
 - Selection probability for upstream *i* is `successes_i / sum(successes_j)` over those windows.
-- Before any upstream has a recorded success (cold start), selection is uniform random.
+- On startup each upstream's window is pre-filled with successes (optimistic prior) so traffic starts evenly split (~50/50 for two workers) until real failures displace them.
 
 Example:
 

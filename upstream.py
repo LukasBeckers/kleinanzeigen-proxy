@@ -27,8 +27,12 @@ class LoadBalancedClient:
             )
         self._timeout = timeout
         self._history_size = history_size
+        # Optimistic prior: each upstream starts with a full window of
+        # successes so selection is 50/50 (or 1/N) until real outcomes
+        # displace them.  Avoids one lucky first pick monopolizing traffic.
         self._outcomes: dict[str, deque[bool]] = {
-            url: deque(maxlen=history_size) for url in self._urls
+            url: deque([True] * history_size, maxlen=history_size)
+            for url in self._urls
         }
         self._request_counts: dict[str, int] = {url: 0 for url in self._urls}
         self._total_requests = 0
@@ -44,18 +48,14 @@ class LoadBalancedClient:
         """Weighted pick: P(i) = successes_i / sum(successes_j).
 
         Each upstream keeps the last ``history_size`` attempt outcomes
-        (success or failure). Only successes contribute weight. When every
-        upstream has zero successes in its window (cold start), fall back to
-        uniform random.
+        (success or failure). Only successes contribute weight. Histories
+        are initialised to all-success so new proxies start with equal
+        weights per upstream.
         """
         if len(self._urls) == 1:
             return self._urls[0]
 
         success_counts = {url: self._success_count(url) for url in self._urls}
-        total_successes = sum(success_counts.values())
-        if total_successes == 0:
-            return random.choice(self._urls)
-
         weights = [success_counts[url] for url in self._urls]
         return random.choices(self._urls, weights=weights, k=1)[0]
 
@@ -93,8 +93,8 @@ class LoadBalancedClient:
             successes_i / sum(successes_j for all j)
 
         where *successes* counts HTTP 2xx completions in that upstream's window.
-        Failed attempts are recorded but add no weight. With no successes yet
-        (cold start), selection is uniform random.
+        Failed attempts are recorded but add no weight. Each upstream's window
+        is pre-filled with successes so traffic starts evenly split.
 
         If the chosen server fails for this request, the error is raised immediately.
         There is no retry or failover to other servers for the same request.
