@@ -110,6 +110,20 @@ If both services run on the same Docker network, use the container name instead:
 API_BASE_URL=http://kleinanzeigen-api:8000
 ```
 
+Multiple upstream API workers can be configured via `API_BASE_URLS` (comma-separated). The proxy load-balances across them using a **success-weighted** strategy:
+
+- Each upstream keeps the last **100** attempt outcomes (HTTP 2xx = success, anything else = failure).
+- Selection probability for upstream *i* is `successes_i / sum(successes_j)` over those windows.
+- Before any upstream has a recorded success (cold start), selection is uniform random.
+
+Example:
+
+```env
+API_BASE_URLS=http://host.docker.internal:8000,http://100.68.101.87:8001
+```
+
+Distribution stats (pick counts and per-upstream success ratios) are logged every 50 requests.
+
 ### 3. Start the proxy
 
 ```bash
