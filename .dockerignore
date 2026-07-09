@@ -1,0 +1,22 @@
+# Runtime data — persisted via compose volume ./data:/data
+data/
+
+# Local secrets and tooling
+.env
+.env.*
+!.env.example
+
+# Git and Python artifacts
+.git
+.gitignore
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Dev-only (not needed in production image)
+tests/
+requirements-dev.txt
+pytest.ini
+Makefile

@@ -130,6 +130,8 @@ Distribution stats (pick counts and per-upstream success ratios) are logged ever
 docker compose up -d --build
 ```
 
+Runtime data (`proxy.db`, cached images) lives in `./data` on the host and is bind-mounted to `/data` in the container. `.dockerignore` excludes `data/` from the image build so rebuilds stay fast; the volume mount is unchanged.
+
 The proxy will be available at `http://localhost:8001`.
 
 ## API Endpoints
