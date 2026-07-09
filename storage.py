@@ -3,6 +3,7 @@ import json
 from datetime import datetime, timezone
 
 from sqlalchemy import select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models import Listing, ListingVersion, new_uuid, utcnow
@@ -126,28 +127,38 @@ async def store_listing(
             pass
 
     if listing is None:
-        # New listing
+        # INSERT OR IGNORE avoids 500s when concurrent cache misses race on the
+        # same adid (SELECT-then-INSERT TOCTOU across parallel requests).
         listing_id = new_uuid()
         version_id = new_uuid()
+        insert_stmt = (
+            sqlite_insert(Listing)
+            .values(
+                id=listing_id,
+                adid=adid,
+                first_seen_at=now,
+                last_seen_at=now,
+                current_version_id=version_id,
+            )
+            .on_conflict_do_nothing(index_elements=["adid"])
+        )
+        insert_result = await session.execute(insert_stmt)
+        if insert_result.rowcount:
+            version = ListingVersion(
+                id=version_id,
+                listing_id=listing_id,
+                fetched_at=now,
+                data_hash=data_hash,
+                **fields,
+            )
+            session.add(version)
+            await session.flush()
+            return listing_id, version_id, True, image_urls
 
-        listing = Listing(
-            id=listing_id,
-            adid=adid,
-            first_seen_at=now,
-            last_seen_at=now,
-            current_version_id=version_id,
-        )
-        version = ListingVersion(
-            id=version_id,
-            listing_id=listing_id,
-            fetched_at=now,
-            data_hash=data_hash,
-            **fields,
-        )
-        session.add(listing)
-        session.add(version)
-        await session.flush()
-        return listing_id, version_id, True, image_urls
+        result = await session.execute(select(Listing).where(Listing.adid == adid))
+        listing = result.scalar_one_or_none()
+        if listing is None:
+            raise RuntimeError(f"listing insert conflict for adid={adid} but row missing")
 
     # Existing listing - check if data changed
     listing.last_seen_at = now

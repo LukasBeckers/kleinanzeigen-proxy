@@ -7,6 +7,7 @@ Spec (from the proxy README):
 - The volatile ``views`` field is *excluded* from the hash so a view-count
   bump alone does NOT create a new version.
 """
+import asyncio
 import sys
 from pathlib import Path
 
@@ -91,6 +92,38 @@ class TestChangedContent:
             # current_version_id should point at the newest (by hash)
             current = next(v for v in versions if v.id == listing.current_version_id)
             assert current.price_amount == "80"
+
+
+class TestConcurrentInsertRace:
+    async def test_parallel_inserts_same_adid_do_not_raise(self, session_factory):
+        """Concurrent cache misses for the same adid must not 500 on UNIQUE."""
+        detail = {
+            "id": "race1",
+            "title": "Moped",
+            "description": "Fast",
+            "url": "https://ka.de/x/race1",
+            "price": {"amount": "200", "currency": "€", "negotiable": False},
+            "views": "1",
+            "images": ["https://img.example/1.jpg"],
+            "details": {},
+            "features": [],
+            "seller": {},
+            "extra_info": {},
+        }
+
+        async def _store():
+            async with session_factory() as s:
+                result = await storage.store_listing(s, detail, source="detail")
+                await s.commit()
+                return result
+
+        results = await asyncio.gather(*[_store() for _ in range(8)])
+        for listing_id, _version_id, _is_new, _urls in results:
+            assert listing_id is not None
+
+        async with session_factory() as s:
+            listings = (await s.execute(select(Listing).where(Listing.adid == "race1"))).scalars().all()
+            assert len(listings) == 1
 
 
 class TestViewsExcludedFromHash:
