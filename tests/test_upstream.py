@@ -210,3 +210,51 @@ class TestLoadBalancedClient:
         assert call_counts["http://a:8000"] + call_counts["http://b:8000"] <= 200
 
         await client.aclose()
+
+    def test_stats_optimistic_prior_equal_probabilities(self):
+        client = LoadBalancedClient(["http://a:8000", "http://b:8000"], timeout=1.0)
+        snap = client.stats()
+        assert snap["history_size"] == 100
+        assert snap["total_requests"] == 0
+        assert len(snap["upstreams"]) == 2
+        by_url = {u["url"]: u for u in snap["upstreams"]}
+        for url in ("http://a:8000", "http://b:8000"):
+            row = by_url[url]
+            assert row["successes"] == 100
+            assert row["failures"] == 0
+            assert row["window_size"] == 100
+            assert row["probability"] == pytest.approx(0.5)
+            assert row["pick_count"] == 0
+
+    def test_stats_probabilities_follow_success_weights(self):
+        client = LoadBalancedClient(
+            ["http://a:8000", "http://b:8000"], timeout=1.0, history_size=100
+        )
+        client._outcomes["http://a:8000"].clear()
+        client._outcomes["http://a:8000"].extend([True] * 80 + [False] * 20)
+        client._outcomes["http://b:8000"].clear()
+        client._outcomes["http://b:8000"].extend([True] * 20 + [False] * 80)
+
+        snap = client.stats()
+        by_url = {u["url"]: u for u in snap["upstreams"]}
+        assert by_url["http://a:8000"]["successes"] == 80
+        assert by_url["http://a:8000"]["failures"] == 20
+        assert by_url["http://b:8000"]["successes"] == 20
+        assert by_url["http://b:8000"]["failures"] == 80
+        assert by_url["http://a:8000"]["probability"] == pytest.approx(0.8)
+        assert by_url["http://b:8000"]["probability"] == pytest.approx(0.2)
+
+    def test_stats_all_failures_uses_equal_probability(self):
+        client = LoadBalancedClient(
+            ["http://a:8000", "http://b:8000"], timeout=1.0, history_size=10
+        )
+        client._outcomes["http://a:8000"].clear()
+        client._outcomes["http://a:8000"].extend([False] * 10)
+        client._outcomes["http://b:8000"].clear()
+        client._outcomes["http://b:8000"].extend([False] * 10)
+
+        snap = client.stats()
+        for row in snap["upstreams"]:
+            assert row["successes"] == 0
+            assert row["failures"] == 10
+            assert row["probability"] == pytest.approx(0.5)

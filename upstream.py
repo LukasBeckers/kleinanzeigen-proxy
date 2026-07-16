@@ -44,6 +44,53 @@ class LoadBalancedClient:
     def _success_count(self, url: str) -> int:
         return sum(1 for ok in self._outcomes[url] if ok)
 
+    def _failure_count(self, url: str) -> int:
+        return sum(1 for ok in self._outcomes[url] if not ok)
+
+    def _probabilities(self) -> dict[str, float]:
+        """Selection probabilities matching ``_pick_upstream`` weights.
+
+        P(i) = successes_i / sum(successes_j). When every upstream has
+        zero successes in its window the picker would error; we surface
+        equal shares (1/N) so dashboards stay well-defined.
+        """
+        if not self._urls:
+            return {}
+        success_counts = {url: self._success_count(url) for url in self._urls}
+        total = sum(success_counts.values())
+        if total == 0:
+            equal = 1.0 / len(self._urls)
+            return {url: equal for url in self._urls}
+        return {url: success_counts[url] / total for url in self._urls}
+
+    def stats(self) -> dict:
+        """Snapshot of sliding-window outcomes and current pick probabilities.
+
+        Intended for admin dashboards (hunter admin panel) and ops probes.
+        """
+        probs = self._probabilities()
+        upstreams = []
+        for url in self._urls:
+            successes = self._success_count(url)
+            failures = self._failure_count(url)
+            window = len(self._outcomes[url])
+            upstreams.append(
+                {
+                    "url": url,
+                    "successes": successes,
+                    "failures": failures,
+                    "window_size": window,
+                    "history_size": self._history_size,
+                    "probability": probs[url],
+                    "pick_count": self._request_counts.get(url, 0),
+                }
+            )
+        return {
+            "history_size": self._history_size,
+            "total_requests": self._total_requests,
+            "upstreams": upstreams,
+        }
+
     def _pick_upstream(self) -> str:
         """Weighted pick: P(i) = successes_i / sum(successes_j).
 

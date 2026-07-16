@@ -128,6 +128,34 @@ API_BASE_URLS=http://host.docker.internal:8000,http://100.68.101.87:8001
 
 Distribution stats (pick counts and per-upstream success ratios) are logged every 50 requests.
 
+Live stats are also exposed as JSON for dashboards:
+
+```bash
+curl http://localhost:8001/upstream-stats
+```
+
+Response shape:
+
+```json
+{
+  "history_size": 100,
+  "total_requests": 42,
+  "upstreams": [
+    {
+      "url": "http://scraper-a:8000",
+      "successes": 95,
+      "failures": 5,
+      "window_size": 100,
+      "history_size": 100,
+      "probability": 0.66,
+      "pick_count": 28
+    }
+  ]
+}
+```
+
+`successes` / `failures` count outcomes in the sliding window used for load balancing. `probability` is the current selection weight (`successes_i / sum(successes_j)`). kleinanzeigen-hunter's admin panel reads this endpoint via `PROXY_BASE_URL`.
+
 ### 3. Start the proxy
 
 ```bash
@@ -140,7 +168,11 @@ The proxy will be available at `http://localhost:8001`.
 
 ## API Endpoints
 
-All endpoints mirror the upstream API and return identical responses.
+Most endpoints mirror the upstream API and return identical responses. Operational endpoints (`/`, `/upstream-stats`) are proxy-only.
+
+### `GET /upstream-stats` - Load-balancer window + probabilities
+
+Returns the rolling success/failure window and current pick probability for every configured upstream worker. See the load-balancing section above for field definitions.
 
 ### `GET /inserate` - Search listings
 

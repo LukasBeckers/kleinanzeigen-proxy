@@ -1,7 +1,7 @@
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 
 from config import settings
 from database import init_db
@@ -46,5 +46,22 @@ async def root():
     return {
         "service": "kleinanzeigen-proxy",
         "upstreams": settings.upstream_urls,
-        "endpoints": ["/inserate", "/inserat/{id}", "/inserate-detailed", "/inserate-detailed-cached"],
+        "endpoints": [
+            "/inserate",
+            "/inserat/{id}",
+            "/inserate-detailed",
+            "/inserate-detailed-cached",
+            "/upstream-stats",
+        ],
     }
+
+
+@app.get("/upstream-stats")
+async def upstream_stats(request: Request):
+    """Sliding-window success/failure counts and current pick probabilities.
+
+    Used by the kleinanzeigen-hunter admin panel to visualize load-balancer
+    health per downstream scraper worker.
+    """
+    client: LoadBalancedClient = request.app.state.upstream_client
+    return client.stats()
