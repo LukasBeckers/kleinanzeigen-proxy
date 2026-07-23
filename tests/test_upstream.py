@@ -117,36 +117,52 @@ class TestLoadBalancedClient:
 
     @pytest.mark.asyncio
     async def test_success_weighted_prefers_reliable_upstream(self):
-        """After history is seeded, picks should follow success weights."""
+        """After history is seeded, picks should follow success weights.
+
+        Keep B unreliable so the window does not converge to 50/50 while
+        sampling; with min_p=0.05 the expected share for A is ~0.95 when B
+        has ~0 successes.
+        """
         call_counts = {"http://a:8000": 0, "http://b:8000": 0}
 
-        def make_handler(url: str):
-            def h(req: httpx.Request) -> httpx.Response:
-                call_counts[url] += 1
-                return httpx.Response(200, json={"success": True})
-            return h
+        def handler_a(req: httpx.Request) -> httpx.Response:
+            call_counts["http://a:8000"] += 1
+            return httpx.Response(200, json={"success": True})
+
+        def handler_b(req: httpx.Request) -> httpx.Response:
+            call_counts["http://b:8000"] += 1
+            raise httpx.ConnectError("unreliable")
 
         urls = ["http://a:8000", "http://b:8000"]
         client = LoadBalancedClient(urls, timeout=1.0, history_size=100)
-        for url in urls:
-            client._clients[url] = httpx.AsyncClient(
-                base_url=url,
-                transport=httpx.MockTransport(make_handler(url)),
-            )
+        client._clients["http://a:8000"] = httpx.AsyncClient(
+            base_url="http://a:8000",
+            transport=httpx.MockTransport(handler_a),
+        )
+        client._clients["http://b:8000"] = httpx.AsyncClient(
+            base_url="http://b:8000",
+            transport=httpx.MockTransport(handler_b),
+        )
 
-        # Seed: A has 80 successes, B has 20 successes in the last 100 attempts each.
+        # Seed: A healthy, B mostly failed.
+        # P(A) ≈ 0.05 + 0.9*(80/100) = 0.77 initially, then drifts toward
+        # ~0.95 as B's remaining successes age out of the window.
+        client._outcomes["http://a:8000"].clear()
         client._outcomes["http://a:8000"].extend([True] * 80 + [False] * 20)
+        client._outcomes["http://b:8000"].clear()
         client._outcomes["http://b:8000"].extend([True] * 20 + [False] * 80)
 
         random.seed(99)
         n_calls = 500
         for _ in range(n_calls):
-            await client.get("/inserate")
+            try:
+                await client.get("/inserate")
+            except httpx.ConnectError:
+                pass
 
-        # Expected weight ratio 80:20 => ~80% to A.
         a_share = call_counts["http://a:8000"] / n_calls
-        assert a_share > 0.65
-        assert a_share < 0.92
+        assert a_share > 0.70
+        assert a_share < 0.98
         assert call_counts["http://a:8000"] + call_counts["http://b:8000"] == n_calls
 
         await client.aclose()
@@ -235,14 +251,16 @@ class TestLoadBalancedClient:
         client._outcomes["http://b:8000"].clear()
         client._outcomes["http://b:8000"].extend([True] * 20 + [False] * 80)
 
+        # P(i) = 0.05 + 0.9 * successes_i / total
         snap = client.stats()
         by_url = {u["url"]: u for u in snap["upstreams"]}
         assert by_url["http://a:8000"]["successes"] == 80
         assert by_url["http://a:8000"]["failures"] == 20
         assert by_url["http://b:8000"]["successes"] == 20
         assert by_url["http://b:8000"]["failures"] == 80
-        assert by_url["http://a:8000"]["probability"] == pytest.approx(0.8)
-        assert by_url["http://b:8000"]["probability"] == pytest.approx(0.2)
+        assert by_url["http://a:8000"]["probability"] == pytest.approx(0.05 + 0.9 * 0.8)
+        assert by_url["http://b:8000"]["probability"] == pytest.approx(0.05 + 0.9 * 0.2)
+        assert snap["min_pick_probability"] == pytest.approx(0.05)
 
     def test_stats_all_failures_uses_equal_probability(self):
         client = LoadBalancedClient(
@@ -258,3 +276,85 @@ class TestLoadBalancedClient:
             assert row["successes"] == 0
             assert row["failures"] == 10
             assert row["probability"] == pytest.approx(0.5)
+
+    def test_zero_success_worker_keeps_min_pick_probability(self):
+        """A fully-failed upstream must not stick at P=0."""
+        client = LoadBalancedClient(
+            ["http://a:8000", "http://b:8000"],
+            timeout=1.0,
+            history_size=100,
+            min_pick_probability=0.05,
+        )
+        client._outcomes["http://a:8000"].clear()
+        client._outcomes["http://a:8000"].extend([True] * 100)
+        client._outcomes["http://b:8000"].clear()
+        client._outcomes["http://b:8000"].extend([False] * 100)
+
+        probs = client._probabilities()
+        assert probs["http://b:8000"] == pytest.approx(0.05)
+        assert probs["http://a:8000"] == pytest.approx(0.95)
+        assert sum(probs.values()) == pytest.approx(1.0)
+
+        snap = client.stats()
+        by_url = {u["url"]: u for u in snap["upstreams"]}
+        assert by_url["http://b:8000"]["probability"] == pytest.approx(0.05)
+        assert by_url["http://a:8000"]["probability"] == pytest.approx(0.95)
+
+    def test_min_pick_probability_clamped_when_many_upstreams(self):
+        """N * min_p must not exceed 1; floor clamps to 1/N."""
+        urls = [f"http://w{i}:8000" for i in range(25)]
+        client = LoadBalancedClient(
+            urls, timeout=1.0, history_size=10, min_pick_probability=0.05
+        )
+        # 25 * 0.05 = 1.25 > 1 → effective min is 1/25
+        assert client._effective_min_pick_probability() == pytest.approx(1.0 / 25)
+        for url in urls:
+            client._outcomes[url].clear()
+            client._outcomes[url].extend([True] * 10)
+        probs = client._probabilities()
+        for p in probs.values():
+            assert p == pytest.approx(1.0 / 25)
+
+    @pytest.mark.asyncio
+    async def test_all_failed_worker_still_gets_picks(self):
+        """Even with 0 successes, the bad worker must keep receiving probes."""
+        call_counts = {"http://a:8000": 0, "http://b:8000": 0}
+
+        def make_handler(url: str):
+            def h(req: httpx.Request) -> httpx.Response:
+                call_counts[url] += 1
+                if url == "http://b:8000":
+                    raise httpx.ConnectError("still down")
+                return httpx.Response(200, json={"success": True})
+            return h
+
+        urls = ["http://a:8000", "http://b:8000"]
+        client = LoadBalancedClient(
+            urls, timeout=1.0, history_size=100, min_pick_probability=0.05
+        )
+        for url in urls:
+            client._clients[url] = httpx.AsyncClient(
+                base_url=url,
+                transport=httpx.MockTransport(make_handler(url)),
+            )
+
+        client._outcomes["http://a:8000"].clear()
+        client._outcomes["http://a:8000"].extend([True] * 100)
+        client._outcomes["http://b:8000"].clear()
+        client._outcomes["http://b:8000"].extend([False] * 100)
+
+        random.seed(7)
+        n_calls = 400
+        for _ in range(n_calls):
+            try:
+                await client.get("/inserate")
+            except httpx.ConnectError:
+                pass
+
+        b_share = call_counts["http://b:8000"] / n_calls
+        # Expect ~5% probes; allow sampling noise.
+        assert b_share > 0.02
+        assert b_share < 0.12
+        assert call_counts["http://b:8000"] > 0
+
+        await client.aclose()

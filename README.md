@@ -114,11 +114,16 @@ If both services run on the same Docker network, use the container name instead:
 API_BASE_URL=http://kleinanzeigen-api:8000
 ```
 
-Multiple upstream API workers can be configured via `API_BASE_URLS` (comma-separated). The proxy load-balances across them using a **success-weighted** strategy:
+Multiple upstream API workers can be configured via `API_BASE_URLS` (comma-separated). The proxy load-balances across them using a **success-weighted** strategy with a recovery floor:
 
 - Each upstream keeps the last **100** attempt outcomes (HTTP 2xx = success, anything else = failure).
-- Selection probability for upstream *i* is `successes_i / sum(successes_j)` over those windows.
+- Selection probability for upstream *i* is:
+
+  `P(i) = min_p + (1 - N·min_p) · successes_i / sum(successes_j)`
+
+  with default `min_p = 5%` (clamped to `1/N` when there are many workers). This keeps a long-failing worker from sticking at 0% pick probability so it can recover once it comes back.
 - On startup each upstream's window is pre-filled with successes (optimistic prior) so traffic starts evenly split (~50/50 for two workers) until real failures displace them.
+- Connect timeout is **10s** (fail fast on offline hosts); read/write still use the full scrape budget (default 300s).
 
 Example:
 
@@ -139,6 +144,7 @@ Response shape:
 ```json
 {
   "history_size": 100,
+  "min_pick_probability": 0.05,
   "total_requests": 42,
   "upstreams": [
     {
