@@ -6,16 +6,15 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+# Admin seed UI offers this step size (0%, 5%, …, 100%).
+PROBABILITY_STEP = 0.05
+
 
 class LoadBalancedClient:
     _LOG_INTERVAL = 50  # Log distribution every N requests
     _HISTORY_SIZE = 100  # Rolling window of attempts per upstream
-    # Floor so a fully-failed worker is still probed and can recover.
-    # Clamped to 1/N when there are more than 1/min_p upstreams.
-    _MIN_PICK_PROBABILITY = 0.05
     # Fail fast on dead hosts; keep a generous read budget for scrapes.
     _CONNECT_TIMEOUT = 10.0
-    _READ_TIMEOUT = 300.0
 
     def __init__(
         self,
@@ -23,14 +22,12 @@ class LoadBalancedClient:
         timeout: float = 300.0,
         *,
         history_size: int = _HISTORY_SIZE,
-        min_pick_probability: float = _MIN_PICK_PROBABILITY,
         connect_timeout: float = _CONNECT_TIMEOUT,
     ):
         self._urls = list(urls)
         self._timeout = timeout
         self._connect_timeout = connect_timeout
         self._history_size = history_size
-        self._min_pick_probability = min_pick_probability
         # httpx: short connect timeout so offline workers don't block for
         # the full scrape budget; read/write use the caller's timeout.
         client_timeout = httpx.Timeout(
@@ -65,43 +62,21 @@ class LoadBalancedClient:
     def _failure_count(self, url: str) -> int:
         return sum(1 for ok in self._outcomes[url] if not ok)
 
-    def _effective_min_pick_probability(self) -> float:
-        """Per-upstream floor, clamped so N * min_p never exceeds 1."""
-        n = len(self._urls)
-        if n == 0:
-            return 0.0
-        return min(self._min_pick_probability, 1.0 / n)
-
     def _probabilities(self) -> dict[str, float]:
         """Selection probabilities matching ``_pick_upstream`` weights.
 
-        Success-weighted share of the residual mass after reserving a
-        minimum pick probability for every upstream::
-
-            P(i) = min_p + (1 - N*min_p) * successes_i / sum(successes)
-
-        When every upstream has zero successes (or only one upstream),
-        traffic is split evenly (1/N). The floor keeps a long-failing
-        worker from sticking at 0% and never being retried.
+        P(i) = successes_i / sum(successes_j). When every upstream has
+        zero successes in its window the picker uses equal shares (1/N)
+        so dashboards stay well-defined and random.choices stays valid.
         """
-        n = len(self._urls)
-        if n == 0:
+        if not self._urls:
             return {}
-        if n == 1:
-            return {self._urls[0]: 1.0}
-
-        min_p = self._effective_min_pick_probability()
         success_counts = {url: self._success_count(url) for url in self._urls}
         total = sum(success_counts.values())
         if total == 0:
-            equal = 1.0 / n
+            equal = 1.0 / len(self._urls)
             return {url: equal for url in self._urls}
-
-        residual = 1.0 - n * min_p
-        return {
-            url: min_p + residual * (success_counts[url] / total)
-            for url in self._urls
-        }
+        return {url: success_counts[url] / total for url in self._urls}
 
     def stats(self) -> dict:
         """Snapshot of sliding-window outcomes and current pick probabilities.
@@ -109,7 +84,6 @@ class LoadBalancedClient:
         Intended for admin dashboards (hunter admin panel) and ops probes.
         """
         probs = self._probabilities()
-        min_p = self._effective_min_pick_probability()
         upstreams = []
         for url in self._urls:
             successes = self._success_count(url)
@@ -128,25 +102,119 @@ class LoadBalancedClient:
             )
         return {
             "history_size": self._history_size,
-            "min_pick_probability": min_p,
             "total_requests": self._total_requests,
             "upstreams": upstreams,
         }
 
+    def _fill_window(self, url: str, successes: int) -> None:
+        """Replace the sliding window with ``successes`` ok + rest fail."""
+        h = self._history_size
+        successes = max(0, min(h, int(successes)))
+        failures = h - successes
+        self._outcomes[url] = deque(
+            [True] * successes + [False] * failures,
+            maxlen=h,
+        )
+
+    @staticmethod
+    def _normalize_probability(probability: float) -> float:
+        """Validate and snap to the 5% admin step grid."""
+        p = float(probability)
+        if p < 0.0 or p > 1.0:
+            raise ValueError("probability must be between 0 and 1 inclusive")
+        steps = round(p / PROBABILITY_STEP)
+        snapped = steps * PROBABILITY_STEP
+        # Guard float noise (e.g. 0.1+0.2) while rejecting off-grid values.
+        if abs(p - snapped) > 1e-9:
+            raise ValueError(
+                f"probability must be a multiple of {PROBABILITY_STEP:g} "
+                f"(got {probability})"
+            )
+        # Avoid 0.30000000000000004 style drift in responses.
+        return round(snapped, 10)
+
+    def seed_pick_probability(self, url: str, probability: float) -> dict:
+        """Rewrite windows so ``url`` has approximately ``probability`` pick weight.
+
+        Fills the target upstream's sliding window with a success/failure mix
+        that yields the requested share under success-weighted selection
+        (P = successes_i / sum successes). Other upstreams are left alone
+        when they already contribute success mass. Special cases:
+
+        * ``probability == 0`` → all failures for this worker.
+        * ``probability == 1`` → all successes here, all failures on others
+          (exclusive traffic).
+        * Other workers at 0 successes and ``0 < p < 1`` → residual success
+          mass is seeded evenly across the others so the ratio is realisable.
+
+        Returns the usual ``stats()`` payload plus a ``seeded`` diagnostic.
+        """
+        if url not in self._outcomes:
+            raise KeyError(f"unknown upstream: {url}")
+
+        p = self._normalize_probability(probability)
+        h = self._history_size
+        others = [u for u in self._urls if u != url]
+
+        if p <= 0.0:
+            self._fill_window(url, 0)
+        elif p >= 1.0 or not others:
+            self._fill_window(url, h)
+            for o in others:
+                self._fill_window(o, 0)
+        else:
+            s_other = sum(self._success_count(o) for o in others)
+            if s_other == 0:
+                # No weight elsewhere — seed residual successes on others so
+                # P(target) ≈ p rather than collapsing to 100%.
+                target_s = max(1, min(h, round(p * h)))
+                residual = max(1, round((1.0 - p) * h))
+                self._fill_window(url, target_s)
+                base, rem = divmod(residual, len(others))
+                for i, o in enumerate(others):
+                    self._fill_window(o, min(h, base + (1 if i < rem else 0)))
+            else:
+                # s / (s + s_other) = p  =>  s = p/(1-p) * s_other
+                raw = p * s_other / (1.0 - p)
+                target_s = max(0, min(h, int(round(raw))))
+                self._fill_window(url, target_s)
+
+        actual = self._probabilities()[url]
+        logger.info(
+            "Seeded upstream %s to requested pick probability %.0f%% "
+            "(window %d/%d ok); actual P=%.1f%%",
+            url,
+            p * 100,
+            self._success_count(url),
+            h,
+            actual * 100,
+        )
+        result = self.stats()
+        result["seeded"] = {
+            "url": url,
+            "requested_probability": p,
+            "actual_probability": actual,
+            "successes": self._success_count(url),
+            "failures": self._failure_count(url),
+        }
+        return result
+
     def _pick_upstream(self) -> str:
-        """Weighted pick with a per-upstream minimum probability floor.
+        """Weighted pick: P(i) = successes_i / sum(successes_j).
 
         Each upstream keeps the last ``history_size`` attempt outcomes
-        (success or failure). Success counts set relative weight; a
-        configurable floor (default 5%) ensures every upstream keeps
-        receiving some traffic so it can recover after a long failure run.
-        Histories are initialised to all-success so new proxies start even.
+        (success or failure). Only successes contribute weight. Histories
+        are initialised to all-success so new proxies start with equal
+        weights per upstream. When every window is all-fail, pick uniformly.
         """
         if len(self._urls) == 1:
             return self._urls[0]
 
-        probs = self._probabilities()
-        weights = [probs[url] for url in self._urls]
+        success_counts = {url: self._success_count(url) for url in self._urls}
+        total = sum(success_counts.values())
+        if total == 0:
+            return random.choice(self._urls)
+        weights = [success_counts[url] for url in self._urls]
         return random.choices(self._urls, weights=weights, k=1)[0]
 
     def _record_outcome(self, url: str, success: bool) -> None:
@@ -182,12 +250,15 @@ class LoadBalancedClient:
         Selection uses the last ``history_size`` attempt outcomes per upstream.
         Probability of picking upstream *i* is::
 
-            min_p + (1 - N*min_p) * successes_i / sum(successes_j)
+            successes_i / sum(successes_j for all j)
 
-        where *successes* counts HTTP 2xx completions in that upstream's window
-        and *min_p* defaults to 5% (clamped to 1/N). Failed attempts are
-        recorded but add no success weight. Each upstream's window is
-        pre-filled with successes so traffic starts evenly split.
+        where *successes* counts HTTP 2xx completions in that upstream's window.
+        Failed attempts are recorded but add no weight. Each upstream's window
+        is pre-filled with successes so traffic starts evenly split.
+
+        Admins can reseed a window via ``seed_pick_probability`` (proxy
+        ``POST /upstream-seed``) so a recovered worker can re-enter at a
+        chosen pick share without waiting for the failure history to age out.
 
         If the chosen server fails for this request, the error is raised immediately.
         There is no retry or failover to other servers for the same request.

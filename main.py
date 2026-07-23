@@ -1,7 +1,8 @@
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel, Field
 
 from config import settings
 from database import init_db
@@ -52,6 +53,7 @@ async def root():
             "/inserate-detailed",
             "/inserate-detailed-cached",
             "/upstream-stats",
+            "/upstream-seed",
         ],
     }
 
@@ -65,3 +67,31 @@ async def upstream_stats(request: Request):
     """
     client: LoadBalancedClient = request.app.state.upstream_client
     return client.stats()
+
+
+class UpstreamSeedBody(BaseModel):
+    url: str = Field(..., min_length=1, description="Exact upstream base URL")
+    probability: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+        description="Target pick probability in 5% steps (0, 0.05, …, 1.0)",
+    )
+
+
+@app.post("/upstream-seed")
+async def upstream_seed(body: UpstreamSeedBody, request: Request):
+    """Reseed one upstream's sliding window to a target pick probability.
+
+    Fills the window with successes/failures so success-weighted selection
+    assigns approximately ``probability`` to this worker. Used by the hunter
+    admin panel (5% step control) to re-introduce a recovered scraper without
+    waiting for a long failure history to age out.
+    """
+    client: LoadBalancedClient = request.app.state.upstream_client
+    try:
+        return client.seed_pick_probability(body.url, body.probability)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc

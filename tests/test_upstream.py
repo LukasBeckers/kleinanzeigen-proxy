@@ -117,12 +117,7 @@ class TestLoadBalancedClient:
 
     @pytest.mark.asyncio
     async def test_success_weighted_prefers_reliable_upstream(self):
-        """After history is seeded, picks should follow success weights.
-
-        Keep B unreliable so the window does not converge to 50/50 while
-        sampling; with min_p=0.05 the expected share for A is ~0.95 when B
-        has ~0 successes.
-        """
+        """After history is seeded, picks should follow success weights."""
         call_counts = {"http://a:8000": 0, "http://b:8000": 0}
 
         def handler_a(req: httpx.Request) -> httpx.Response:
@@ -144,9 +139,7 @@ class TestLoadBalancedClient:
             transport=httpx.MockTransport(handler_b),
         )
 
-        # Seed: A healthy, B mostly failed.
-        # P(A) ≈ 0.05 + 0.9*(80/100) = 0.77 initially, then drifts toward
-        # ~0.95 as B's remaining successes age out of the window.
+        # Seed: A 80 ok, B 20 ok → ~80% traffic to A under pure success weights.
         client._outcomes["http://a:8000"].clear()
         client._outcomes["http://a:8000"].extend([True] * 80 + [False] * 20)
         client._outcomes["http://b:8000"].clear()
@@ -251,16 +244,14 @@ class TestLoadBalancedClient:
         client._outcomes["http://b:8000"].clear()
         client._outcomes["http://b:8000"].extend([True] * 20 + [False] * 80)
 
-        # P(i) = 0.05 + 0.9 * successes_i / total
         snap = client.stats()
         by_url = {u["url"]: u for u in snap["upstreams"]}
         assert by_url["http://a:8000"]["successes"] == 80
         assert by_url["http://a:8000"]["failures"] == 20
         assert by_url["http://b:8000"]["successes"] == 20
         assert by_url["http://b:8000"]["failures"] == 80
-        assert by_url["http://a:8000"]["probability"] == pytest.approx(0.05 + 0.9 * 0.8)
-        assert by_url["http://b:8000"]["probability"] == pytest.approx(0.05 + 0.9 * 0.2)
-        assert snap["min_pick_probability"] == pytest.approx(0.05)
+        assert by_url["http://a:8000"]["probability"] == pytest.approx(0.8)
+        assert by_url["http://b:8000"]["probability"] == pytest.approx(0.2)
 
     def test_stats_all_failures_uses_equal_probability(self):
         client = LoadBalancedClient(
@@ -277,13 +268,12 @@ class TestLoadBalancedClient:
             assert row["failures"] == 10
             assert row["probability"] == pytest.approx(0.5)
 
-    def test_zero_success_worker_keeps_min_pick_probability(self):
-        """A fully-failed upstream must not stick at P=0."""
+    def test_zero_success_worker_has_zero_pick_probability(self):
+        """Without admin reseed, a fully-failed upstream has P=0."""
         client = LoadBalancedClient(
             ["http://a:8000", "http://b:8000"],
             timeout=1.0,
             history_size=100,
-            min_pick_probability=0.05,
         )
         client._outcomes["http://a:8000"].clear()
         client._outcomes["http://a:8000"].extend([True] * 100)
@@ -291,70 +281,63 @@ class TestLoadBalancedClient:
         client._outcomes["http://b:8000"].extend([False] * 100)
 
         probs = client._probabilities()
-        assert probs["http://b:8000"] == pytest.approx(0.05)
-        assert probs["http://a:8000"] == pytest.approx(0.95)
-        assert sum(probs.values()) == pytest.approx(1.0)
+        assert probs["http://b:8000"] == pytest.approx(0.0)
+        assert probs["http://a:8000"] == pytest.approx(1.0)
 
-        snap = client.stats()
-        by_url = {u["url"]: u for u in snap["upstreams"]}
-        assert by_url["http://b:8000"]["probability"] == pytest.approx(0.05)
-        assert by_url["http://a:8000"]["probability"] == pytest.approx(0.95)
-
-    def test_min_pick_probability_clamped_when_many_upstreams(self):
-        """N * min_p must not exceed 1; floor clamps to 1/N."""
-        urls = [f"http://w{i}:8000" for i in range(25)]
+    def test_seed_pick_probability_restores_failed_worker(self):
+        """Admin reseed fills the window so a dead worker re-enters at ~35%."""
         client = LoadBalancedClient(
-            urls, timeout=1.0, history_size=10, min_pick_probability=0.05
+            ["http://a:8000", "http://b:8000"],
+            timeout=1.0,
+            history_size=100,
         )
-        # 25 * 0.05 = 1.25 > 1 → effective min is 1/25
-        assert client._effective_min_pick_probability() == pytest.approx(1.0 / 25)
-        for url in urls:
-            client._outcomes[url].clear()
-            client._outcomes[url].extend([True] * 10)
-        probs = client._probabilities()
-        for p in probs.values():
-            assert p == pytest.approx(1.0 / 25)
-
-    @pytest.mark.asyncio
-    async def test_all_failed_worker_still_gets_picks(self):
-        """Even with 0 successes, the bad worker must keep receiving probes."""
-        call_counts = {"http://a:8000": 0, "http://b:8000": 0}
-
-        def make_handler(url: str):
-            def h(req: httpx.Request) -> httpx.Response:
-                call_counts[url] += 1
-                if url == "http://b:8000":
-                    raise httpx.ConnectError("still down")
-                return httpx.Response(200, json={"success": True})
-            return h
-
-        urls = ["http://a:8000", "http://b:8000"]
-        client = LoadBalancedClient(
-            urls, timeout=1.0, history_size=100, min_pick_probability=0.05
-        )
-        for url in urls:
-            client._clients[url] = httpx.AsyncClient(
-                base_url=url,
-                transport=httpx.MockTransport(make_handler(url)),
-            )
-
         client._outcomes["http://a:8000"].clear()
         client._outcomes["http://a:8000"].extend([True] * 100)
         client._outcomes["http://b:8000"].clear()
         client._outcomes["http://b:8000"].extend([False] * 100)
 
-        random.seed(7)
-        n_calls = 400
-        for _ in range(n_calls):
-            try:
-                await client.get("/inserate")
-            except httpx.ConnectError:
-                pass
+        result = client.seed_pick_probability("http://b:8000", 0.35)
+        by_url = {u["url"]: u for u in result["upstreams"]}
+        # s = 0.35/0.65 * 100 ≈ 54 → P ≈ 54/154 ≈ 0.3506
+        assert by_url["http://b:8000"]["successes"] == 54
+        assert by_url["http://b:8000"]["failures"] == 46
+        assert by_url["http://b:8000"]["probability"] == pytest.approx(0.35, abs=0.02)
+        assert result["seeded"]["requested_probability"] == 0.35
+        assert result["seeded"]["actual_probability"] == pytest.approx(0.35, abs=0.02)
 
-        b_share = call_counts["http://b:8000"] / n_calls
-        # Expect ~5% probes; allow sampling noise.
-        assert b_share > 0.02
-        assert b_share < 0.12
-        assert call_counts["http://b:8000"] > 0
+    def test_seed_pick_probability_zero_and_full(self):
+        client = LoadBalancedClient(
+            ["http://a:8000", "http://b:8000"], timeout=1.0, history_size=100
+        )
+        client.seed_pick_probability("http://b:8000", 0.0)
+        assert client._success_count("http://b:8000") == 0
+        assert client._probabilities()["http://b:8000"] == pytest.approx(0.0)
 
-        await client.aclose()
+        client.seed_pick_probability("http://b:8000", 1.0)
+        assert client._success_count("http://b:8000") == 100
+        assert client._success_count("http://a:8000") == 0
+        assert client._probabilities()["http://b:8000"] == pytest.approx(1.0)
+
+    def test_seed_rejects_unknown_url_and_off_grid_probability(self):
+        client = LoadBalancedClient(
+            ["http://a:8000", "http://b:8000"], timeout=1.0, history_size=100
+        )
+        with pytest.raises(KeyError):
+            client.seed_pick_probability("http://missing:8000", 0.5)
+        with pytest.raises(ValueError, match="multiple of"):
+            client.seed_pick_probability("http://a:8000", 0.33)
+        with pytest.raises(ValueError, match="between 0 and 1"):
+            client.seed_pick_probability("http://a:8000", 1.5)
+
+    def test_seed_when_others_have_zero_successes(self):
+        """If everyone is at 0, residual mass is seeded on others so P≈target."""
+        client = LoadBalancedClient(
+            ["http://a:8000", "http://b:8000"], timeout=1.0, history_size=100
+        )
+        client._fill_window("http://a:8000", 0)
+        client._fill_window("http://b:8000", 0)
+
+        result = client.seed_pick_probability("http://b:8000", 0.35)
+        assert result["seeded"]["actual_probability"] == pytest.approx(0.35, abs=0.05)
+        assert client._success_count("http://b:8000") > 0
+        assert client._success_count("http://a:8000") > 0
