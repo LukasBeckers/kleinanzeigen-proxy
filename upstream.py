@@ -178,11 +178,11 @@ class LoadBalancedClient:
             )
         return round(snapped, 10)
 
-    def seed_window_fail_rate(self, url: str, fail_rate: float) -> dict:
-        """Rewrite one upstream's window to a given failure rate.
+    def seed_window_success_rate(self, url: str, success_rate: float) -> dict:
+        """Rewrite one upstream's window to a given success rate.
 
-        ``fail_rate`` is the fraction of the sliding window that should be
-        failures (0 = all success, 1 = all fail), in 5% steps. Only this
+        ``success_rate`` is the fraction of the sliding window that should be
+        successes (0 = all fail, 1 = all success), in 5% steps. Only this
         worker's window is touched — other workers are unchanged. Pick
         probability then follows from relative success counts as usual.
 
@@ -191,16 +191,16 @@ class LoadBalancedClient:
         if url not in self._outcomes:
             raise KeyError(f"unknown upstream: {url}")
 
-        rate = self._normalize_rate(fail_rate, name="fail_rate")
+        rate = self._normalize_rate(success_rate, name="success_rate")
         h = self._history_size
-        failures = int(round(rate * h))
-        successes = h - failures
+        successes = int(round(rate * h))
+        failures = h - successes
         self._fill_window(url, successes)
 
-        window_fail = failures / h if h else 0.0
+        window_success = successes / h if h else 0.0
         actual_pick = self._probabilities()[url]
         logger.info(
-            "Seeded upstream %s to fail_rate=%.0f%% "
+            "Seeded upstream %s to success_rate=%.0f%% "
             "(window %d ok / %d fail); pick P=%.1f%%",
             url,
             rate * 100,
@@ -211,8 +211,8 @@ class LoadBalancedClient:
         result = self.stats()
         result["seeded"] = {
             "url": url,
-            "requested_fail_rate": rate,
-            "actual_fail_rate": window_fail,
+            "requested_success_rate": rate,
+            "actual_success_rate": window_success,
             "actual_probability": actual_pick,
             "successes": successes,
             "failures": failures,
@@ -278,7 +278,7 @@ class LoadBalancedClient:
         window is pre-filled with successes so traffic starts evenly split
         (modulo weights).
 
-        Admins can reseed a window via ``seed_window_fail_rate`` (proxy
+        Admins can reseed a window via ``seed_window_success_rate`` (proxy
         ``POST /upstream-seed``) so a recovered worker's history is not
         stuck at all-failures after an outage.
 
