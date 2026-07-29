@@ -81,7 +81,8 @@ class LoadBalancedClient:
     def stats(self) -> dict:
         """Snapshot of sliding-window outcomes and current pick probabilities.
 
-        Intended for admin dashboards (hunter admin panel) and ops probes.
+        Each upstream includes ``outcomes``: ordered booleans (oldest → newest)
+        so the admin UI can render a per-attempt timeline (green=ok, red=fail).
         """
         probs = self._probabilities()
         upstreams = []
@@ -89,6 +90,8 @@ class LoadBalancedClient:
             successes = self._success_count(url)
             failures = self._failure_count(url)
             window = len(self._outcomes[url])
+            # Oldest first so left side of the bar is the past.
+            outcomes = list(self._outcomes[url])
             upstreams.append(
                 {
                     "url": url,
@@ -98,6 +101,7 @@ class LoadBalancedClient:
                     "history_size": self._history_size,
                     "probability": probs[url],
                     "pick_count": self._request_counts.get(url, 0),
+                    "outcomes": outcomes,
                 }
             )
         return {
@@ -107,95 +111,71 @@ class LoadBalancedClient:
         }
 
     def _fill_window(self, url: str, successes: int) -> None:
-        """Replace the sliding window with ``successes`` ok + rest fail."""
+        """Replace the sliding window with ``successes`` ok + rest fail.
+
+        Ordering: failures first (older), successes last (newer) so a
+        recovered worker's timeline shows green at the right edge.
+        """
         h = self._history_size
         successes = max(0, min(h, int(successes)))
         failures = h - successes
         self._outcomes[url] = deque(
-            [True] * successes + [False] * failures,
+            [False] * failures + [True] * successes,
             maxlen=h,
         )
 
     @staticmethod
-    def _normalize_probability(probability: float) -> float:
+    def _normalize_rate(rate: float, *, name: str = "rate") -> float:
         """Validate and snap to the 5% admin step grid."""
-        p = float(probability)
+        p = float(rate)
         if p < 0.0 or p > 1.0:
-            raise ValueError("probability must be between 0 and 1 inclusive")
+            raise ValueError(f"{name} must be between 0 and 1 inclusive")
         steps = round(p / PROBABILITY_STEP)
         snapped = steps * PROBABILITY_STEP
-        # Guard float noise (e.g. 0.1+0.2) while rejecting off-grid values.
         if abs(p - snapped) > 1e-9:
             raise ValueError(
-                f"probability must be a multiple of {PROBABILITY_STEP:g} "
-                f"(got {probability})"
+                f"{name} must be a multiple of {PROBABILITY_STEP:g} (got {rate})"
             )
-        # Avoid 0.30000000000000004 style drift in responses.
         return round(snapped, 10)
 
-    def seed_pick_probability(self, url: str, probability: float) -> dict:
-        """Rewrite windows so ``url`` has approximately ``probability`` pick weight.
+    def seed_window_fail_rate(self, url: str, fail_rate: float) -> dict:
+        """Rewrite one upstream's window to a given failure rate.
 
-        Fills the target upstream's sliding window with a success/failure mix
-        that yields the requested share under success-weighted selection
-        (P = successes_i / sum successes). Other upstreams are left alone
-        when they already contribute success mass. Special cases:
-
-        * ``probability == 0`` → all failures for this worker.
-        * ``probability == 1`` → all successes here, all failures on others
-          (exclusive traffic).
-        * Other workers at 0 successes and ``0 < p < 1`` → residual success
-          mass is seeded evenly across the others so the ratio is realisable.
+        ``fail_rate`` is the fraction of the sliding window that should be
+        failures (0 = all success, 1 = all fail), in 5% steps. Only this
+        worker's window is touched — other workers are unchanged. Pick
+        probability then follows from relative success counts as usual.
 
         Returns the usual ``stats()`` payload plus a ``seeded`` diagnostic.
         """
         if url not in self._outcomes:
             raise KeyError(f"unknown upstream: {url}")
 
-        p = self._normalize_probability(probability)
+        rate = self._normalize_rate(fail_rate, name="fail_rate")
         h = self._history_size
-        others = [u for u in self._urls if u != url]
+        failures = int(round(rate * h))
+        successes = h - failures
+        self._fill_window(url, successes)
 
-        if p <= 0.0:
-            self._fill_window(url, 0)
-        elif p >= 1.0 or not others:
-            self._fill_window(url, h)
-            for o in others:
-                self._fill_window(o, 0)
-        else:
-            s_other = sum(self._success_count(o) for o in others)
-            if s_other == 0:
-                # No weight elsewhere — seed residual successes on others so
-                # P(target) ≈ p rather than collapsing to 100%.
-                target_s = max(1, min(h, round(p * h)))
-                residual = max(1, round((1.0 - p) * h))
-                self._fill_window(url, target_s)
-                base, rem = divmod(residual, len(others))
-                for i, o in enumerate(others):
-                    self._fill_window(o, min(h, base + (1 if i < rem else 0)))
-            else:
-                # s / (s + s_other) = p  =>  s = p/(1-p) * s_other
-                raw = p * s_other / (1.0 - p)
-                target_s = max(0, min(h, int(round(raw))))
-                self._fill_window(url, target_s)
-
-        actual = self._probabilities()[url]
+        window_fail = failures / h if h else 0.0
+        actual_pick = self._probabilities()[url]
         logger.info(
-            "Seeded upstream %s to requested pick probability %.0f%% "
-            "(window %d/%d ok); actual P=%.1f%%",
+            "Seeded upstream %s to fail_rate=%.0f%% "
+            "(window %d ok / %d fail); pick P=%.1f%%",
             url,
-            p * 100,
-            self._success_count(url),
-            h,
-            actual * 100,
+            rate * 100,
+            successes,
+            failures,
+            actual_pick * 100,
         )
         result = self.stats()
         result["seeded"] = {
             "url": url,
-            "requested_probability": p,
-            "actual_probability": actual,
-            "successes": self._success_count(url),
-            "failures": self._failure_count(url),
+            "requested_fail_rate": rate,
+            "actual_fail_rate": window_fail,
+            "actual_probability": actual_pick,
+            "successes": successes,
+            "failures": failures,
         }
         return result
 
@@ -256,9 +236,9 @@ class LoadBalancedClient:
         Failed attempts are recorded but add no weight. Each upstream's window
         is pre-filled with successes so traffic starts evenly split.
 
-        Admins can reseed a window via ``seed_pick_probability`` (proxy
-        ``POST /upstream-seed``) so a recovered worker can re-enter at a
-        chosen pick share without waiting for the failure history to age out.
+        Admins can reseed a window via ``seed_window_fail_rate`` (proxy
+        ``POST /upstream-seed``) so a recovered worker's history is not
+        stuck at all-failures after an outage.
 
         If the chosen server fails for this request, the error is raised immediately.
         There is no retry or failover to other servers for the same request.

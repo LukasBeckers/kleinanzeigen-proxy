@@ -120,7 +120,7 @@ Multiple upstream API workers can be configured via `API_BASE_URLS` (comma-separ
 - Selection probability for upstream *i* is `successes_i / sum(successes_j)` over those windows.
 - On startup each upstream's window is pre-filled with successes (optimistic prior) so traffic starts evenly split (~50/50 for two workers) until real failures displace them.
 - Connect timeout is **10s** (fail fast on offline hosts); read/write still use the full scrape budget (default 300s).
-- A long failure run can push a worker to **0% pick probability**. Admins can reseed its sliding window (success/fail mix) so it re-enters at a chosen share — see `POST /upstream-seed` and the hunter Admin page (5% steps).
+- A long failure run can push a worker to **0% pick probability**. Admins can reseed its sliding window to a chosen **fail rate** (fraction of the last N attempts marked failed) — see `POST /upstream-seed` and the hunter Admin page (5% steps).
 
 Example:
 
@@ -156,19 +156,19 @@ Response shape:
 }
 ```
 
-### Admin: reseed pick probability
+### Admin: reseed window fail rate
 
-When a worker is stuck at 0% after a long outage, reseed its sliding window so success-weighted selection assigns a target pick share again (multiples of 5%):
+When a worker is stuck at 0% pick weight after a long outage, reseed **that worker's** sliding window so a chosen fraction of the last N attempts are failures (rest successes), in 5% steps. Other workers are left alone; pick probability then follows from relative success counts.
 
 ```bash
 curl -X POST http://localhost:8001/upstream-seed \
   -H 'Content-Type: application/json' \
-  -d '{"url":"http://100.68.101.87:8001","probability":0.35}'
+  -d '{"url":"http://100.68.101.87:8001","fail_rate":0.20}'
 ```
 
-This fills the chosen upstream's last-100 window with the success/failure mix that yields approximately the requested pick probability relative to the other workers' current success counts. Response is the usual stats payload plus a `seeded` diagnostic (`requested_probability`, `actual_probability`, window counts).
+Example: `fail_rate: 0.20` on a history of 100 → 80 successes + 20 failures for that worker. Response is the usual stats payload plus a `seeded` diagnostic.
 
-`successes` / `failures` count outcomes in the sliding window used for load balancing. `probability` is the current selection weight (`successes_i / sum(successes_j)`). kleinanzeigen-hunter's admin panel reads this endpoint via `PROXY_BASE_URL`.
+`successes` / `failures` count outcomes in the sliding window. `outcomes` is the ordered list (oldest → newest, `true`=ok) for the timeline UI. `probability` is the current selection weight (`successes_i / sum(successes_j)`). kleinanzeigen-hunter's admin panel reads this via `PROXY_BASE_URL`.
 
 ### 3. Start the proxy
 
@@ -188,9 +188,9 @@ Most endpoints mirror the upstream API and return identical responses. Operation
 
 Returns the rolling success/failure window and current pick probability for every configured upstream worker. See the load-balancing section above for field definitions.
 
-### `POST /upstream-seed` - Reseed one worker's pick probability
+### `POST /upstream-seed` - Reseed one worker's window fail rate
 
-Body: `{ "url": "<exact upstream base URL>", "probability": 0.35 }` with probability in 5% steps. Rewrites that worker's sliding window (and, for 100% or all-zero peers, related windows) so success-weighted selection matches the target share. See the load-balancing section above.
+Body: `{ "url": "<exact upstream base URL>", "fail_rate": 0.20 }` with `fail_rate` in 5% steps (0 = all success, 1 = all fail). Rewrites only that worker's sliding window. See the load-balancing section above.
 
 ### `GET /inserate` - Search listings
 

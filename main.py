@@ -71,26 +71,28 @@ async def upstream_stats(request: Request):
 
 class UpstreamSeedBody(BaseModel):
     url: str = Field(..., min_length=1, description="Exact upstream base URL")
-    probability: float = Field(
+    fail_rate: float = Field(
         ...,
         ge=0.0,
         le=1.0,
-        description="Target pick probability in 5% steps (0, 0.05, …, 1.0)",
+        description=(
+            "Fraction of this worker's sliding window that should be failures "
+            "(0 = all success, 1 = all fail), in 5% steps"
+        ),
     )
 
 
 @app.post("/upstream-seed")
 async def upstream_seed(body: UpstreamSeedBody, request: Request):
-    """Reseed one upstream's sliding window to a target pick probability.
+    """Reseed one upstream's sliding window to a given failure rate.
 
-    Fills the window with successes/failures so success-weighted selection
-    assigns approximately ``probability`` to this worker. Used by the hunter
-    admin panel (5% step control) to re-introduce a recovered scraper without
-    waiting for a long failure history to age out.
+    Sets that worker's last-N outcomes so ``fail_rate`` of them are failures
+    (and the rest successes). Does not change other workers. Used by the
+    hunter admin panel after a recovered scraper was stuck at 0% pick weight.
     """
     client: LoadBalancedClient = request.app.state.upstream_client
     try:
-        return client.seed_pick_probability(body.url, body.probability)
+        return client.seed_window_fail_rate(body.url, body.fail_rate)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:

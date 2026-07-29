@@ -284,8 +284,8 @@ class TestLoadBalancedClient:
         assert probs["http://b:8000"] == pytest.approx(0.0)
         assert probs["http://a:8000"] == pytest.approx(1.0)
 
-    def test_seed_pick_probability_restores_failed_worker(self):
-        """Admin reseed fills the window so a dead worker re-enters at ~35%."""
+    def test_seed_window_fail_rate_sets_success_fail_counts(self):
+        """Admin reseed sets this worker's window fail fraction only."""
         client = LoadBalancedClient(
             ["http://a:8000", "http://b:8000"],
             timeout=1.0,
@@ -296,48 +296,56 @@ class TestLoadBalancedClient:
         client._outcomes["http://b:8000"].clear()
         client._outcomes["http://b:8000"].extend([False] * 100)
 
-        result = client.seed_pick_probability("http://b:8000", 0.35)
+        # 20% fail → 80 ok / 20 fail; pick weight = 80/(100+80) ≈ 44.4%
+        result = client.seed_window_fail_rate("http://b:8000", 0.20)
         by_url = {u["url"]: u for u in result["upstreams"]}
-        # s = 0.35/0.65 * 100 ≈ 54 → P ≈ 54/154 ≈ 0.3506
-        assert by_url["http://b:8000"]["successes"] == 54
-        assert by_url["http://b:8000"]["failures"] == 46
-        assert by_url["http://b:8000"]["probability"] == pytest.approx(0.35, abs=0.02)
-        assert result["seeded"]["requested_probability"] == 0.35
-        assert result["seeded"]["actual_probability"] == pytest.approx(0.35, abs=0.02)
+        assert by_url["http://b:8000"]["successes"] == 80
+        assert by_url["http://b:8000"]["failures"] == 20
+        assert by_url["http://a:8000"]["successes"] == 100  # untouched
+        assert result["seeded"]["requested_fail_rate"] == 0.20
+        assert result["seeded"]["actual_fail_rate"] == pytest.approx(0.20)
+        assert by_url["http://b:8000"]["probability"] == pytest.approx(80 / 180)
 
-    def test_seed_pick_probability_zero_and_full(self):
+    def test_seed_window_fail_rate_zero_and_full(self):
         client = LoadBalancedClient(
             ["http://a:8000", "http://b:8000"], timeout=1.0, history_size=100
         )
-        client.seed_pick_probability("http://b:8000", 0.0)
-        assert client._success_count("http://b:8000") == 0
-        assert client._probabilities()["http://b:8000"] == pytest.approx(0.0)
-
-        client.seed_pick_probability("http://b:8000", 1.0)
+        client.seed_window_fail_rate("http://b:8000", 0.0)
         assert client._success_count("http://b:8000") == 100
-        assert client._success_count("http://a:8000") == 0
-        assert client._probabilities()["http://b:8000"] == pytest.approx(1.0)
+        assert client._failure_count("http://b:8000") == 0
 
-    def test_seed_rejects_unknown_url_and_off_grid_probability(self):
+        client.seed_window_fail_rate("http://b:8000", 1.0)
+        assert client._success_count("http://b:8000") == 0
+        assert client._failure_count("http://b:8000") == 100
+
+    def test_seed_rejects_unknown_url_and_off_grid_fail_rate(self):
         client = LoadBalancedClient(
             ["http://a:8000", "http://b:8000"], timeout=1.0, history_size=100
         )
         with pytest.raises(KeyError):
-            client.seed_pick_probability("http://missing:8000", 0.5)
+            client.seed_window_fail_rate("http://missing:8000", 0.5)
         with pytest.raises(ValueError, match="multiple of"):
-            client.seed_pick_probability("http://a:8000", 0.33)
+            client.seed_window_fail_rate("http://a:8000", 0.33)
         with pytest.raises(ValueError, match="between 0 and 1"):
-            client.seed_pick_probability("http://a:8000", 1.5)
+            client.seed_window_fail_rate("http://a:8000", 1.5)
 
-    def test_seed_when_others_have_zero_successes(self):
-        """If everyone is at 0, residual mass is seeded on others so P≈target."""
+    def test_stats_outcomes_are_oldest_to_newest(self):
         client = LoadBalancedClient(
-            ["http://a:8000", "http://b:8000"], timeout=1.0, history_size=100
+            ["http://a:8000"], timeout=1.0, history_size=5
         )
-        client._fill_window("http://a:8000", 0)
-        client._fill_window("http://b:8000", 0)
+        client._outcomes["http://a:8000"].clear()
+        # Append in time order: oldest first
+        for ok in (True, True, False, True, False):
+            client._outcomes["http://a:8000"].append(ok)
+        snap = client.stats()
+        assert snap["upstreams"][0]["outcomes"] == [
+            True, True, False, True, False
+        ]
 
-        result = client.seed_pick_probability("http://b:8000", 0.35)
-        assert result["seeded"]["actual_probability"] == pytest.approx(0.35, abs=0.05)
-        assert client._success_count("http://b:8000") > 0
-        assert client._success_count("http://a:8000") > 0
+    def test_seed_window_orders_failures_older_than_successes(self):
+        client = LoadBalancedClient(
+            ["http://a:8000"], timeout=1.0, history_size=10
+        )
+        client.seed_window_fail_rate("http://a:8000", 0.30)
+        outcomes = list(client._outcomes["http://a:8000"])
+        assert outcomes == [False] * 3 + [True] * 7
