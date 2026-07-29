@@ -3,9 +3,20 @@ import json
 from datetime import datetime, timezone
 
 from sqlalchemy import select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models import Listing, ListingVersion, new_uuid, utcnow
+
+
+def _source_is_detail(source: str) -> bool:
+    """Whether *source* represents a full listing page (not a search card)."""
+    return source in {"detail", "combined"}
+
+
+def _detail_image_urls(images) -> str:
+    """Persist gallery URLs for detail/combined fetches (``[]`` when empty)."""
+    return json.dumps(images if images is not None else [])
 
 
 def _extract_version_fields(data: dict, source: str) -> dict:
@@ -57,7 +68,7 @@ def _extract_version_fields(data: dict, source: str) -> dict:
         fields["features"] = json.dumps(data.get("features")) if data.get("features") else None
         fields["seller"] = json.dumps(data.get("seller")) if data.get("seller") else None
         fields["extra_info"] = json.dumps(data.get("extra_info")) if data.get("extra_info") else None
-        fields["image_urls"] = json.dumps(data.get("images")) if data.get("images") else None
+        fields["image_urls"] = _detail_image_urls(data.get("images"))
     elif source == "combined":
         # Combined endpoint: top-level has search fields, "details" has detail fields
         detail = data.get("details", {}) or {}
@@ -86,7 +97,7 @@ def _extract_version_fields(data: dict, source: str) -> dict:
         fields["features"] = json.dumps(detail.get("features")) if detail.get("features") else None
         fields["seller"] = json.dumps(detail.get("seller")) if detail.get("seller") else None
         fields["extra_info"] = json.dumps(detail.get("extra_info")) if detail.get("extra_info") else None
-        fields["image_urls"] = json.dumps(detail.get("images")) if detail.get("images") else None
+        fields["image_urls"] = _detail_image_urls(detail.get("images"))
 
     return fields
 
@@ -111,6 +122,7 @@ async def store_listing(
         return None, None, False, []
 
     fields = _extract_version_fields(data, source)
+    is_detail = _source_is_detail(source)
     data_hash = _compute_hash(fields)
     now = utcnow()
 
@@ -118,36 +130,43 @@ async def store_listing(
     result = await session.execute(select(Listing).where(Listing.adid == adid))
     listing = result.scalar_one_or_none()
 
-    image_urls = []
-    if fields.get("image_urls"):
-        try:
-            image_urls = json.loads(fields["image_urls"])
-        except (json.JSONDecodeError, TypeError):
-            pass
+    image_urls = _json_or([], fields.get("image_urls"))
 
     if listing is None:
-        # New listing
+        # INSERT OR IGNORE avoids 500s when concurrent cache misses race on the
+        # same adid (SELECT-then-INSERT TOCTOU across parallel requests).
         listing_id = new_uuid()
         version_id = new_uuid()
+        insert_stmt = (
+            sqlite_insert(Listing)
+            .values(
+                id=listing_id,
+                adid=adid,
+                first_seen_at=now,
+                last_seen_at=now,
+                current_version_id=version_id,
+                has_detail=is_detail,
+            )
+            .on_conflict_do_nothing(index_elements=["adid"])
+        )
+        insert_result = await session.execute(insert_stmt)
+        if insert_result.rowcount:
+            version = ListingVersion(
+                id=version_id,
+                listing_id=listing_id,
+                fetched_at=now,
+                data_hash=data_hash,
+                is_detail=is_detail,
+                **fields,
+            )
+            session.add(version)
+            await session.flush()
+            return listing_id, version_id, True, image_urls
 
-        listing = Listing(
-            id=listing_id,
-            adid=adid,
-            first_seen_at=now,
-            last_seen_at=now,
-            current_version_id=version_id,
-        )
-        version = ListingVersion(
-            id=version_id,
-            listing_id=listing_id,
-            fetched_at=now,
-            data_hash=data_hash,
-            **fields,
-        )
-        session.add(listing)
-        session.add(version)
-        await session.flush()
-        return listing_id, version_id, True, image_urls
+        result = await session.execute(select(Listing).where(Listing.adid == adid))
+        listing = result.scalar_one_or_none()
+        if listing is None:
+            raise RuntimeError(f"listing insert conflict for adid={adid} but row missing")
 
     # Existing listing - check if data changed
     listing.last_seen_at = now
@@ -172,9 +191,11 @@ async def store_listing(
         listing_id=listing.id,
         fetched_at=now,
         data_hash=data_hash,
+        is_detail=is_detail,
         **fields,
     )
     listing.current_version_id = version_id
+    listing.has_detail = is_detail
     session.add(version)
     await session.flush()
     return listing.id, version_id, True, image_urls
@@ -210,26 +231,23 @@ def _json_or(default, value):
 async def get_cached_detail(session: AsyncSession, adid: str) -> dict | None:
     """Rebuild a ``/inserat/{id}.data`` shaped dict from the archive.
 
-    Returns ``None`` when we have no detail-source version for this adid
-    (i.e. we've only seen it via ``/inserate`` search cards, or never at
-    all).  The cache-hit marker is ``image_urls IS NOT NULL``, because
-    ``storage.py`` only populates it on ``source in {"detail", "combined"}``.
+    Returns ``None`` when we have no detail snapshot for this adid (search-card
+    archival only, or never stored).  Uses ``listings.has_detail`` and the
+    current version's ``is_detail`` flag — not field presence heuristics.
 
     Caller is responsible for falling back to the live ``/inserat/{id}``
     upstream call when this returns ``None``.
     """
     result = await session.execute(select(Listing).where(Listing.adid == adid))
     listing = result.scalar_one_or_none()
-    if listing is None or listing.current_version_id is None:
+    if listing is None or not listing.has_detail or listing.current_version_id is None:
         return None
 
     result = await session.execute(
         select(ListingVersion).where(ListingVersion.id == listing.current_version_id)
     )
     v = result.scalar_one_or_none()
-    if v is None or v.image_urls is None:
-        # ``image_urls is None`` means the version was captured via the
-        # search-cards endpoint only — not a full detail fetch.
+    if v is None or not v.is_detail:
         return None
 
     return {

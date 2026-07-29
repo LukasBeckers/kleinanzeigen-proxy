@@ -23,6 +23,8 @@ class Listing(Base):
     first_seen_at = Column(DateTime, default=utcnow)
     last_seen_at = Column(DateTime, default=utcnow, onupdate=utcnow)
     current_version_id = Column(Text, ForeignKey("listing_versions.id"), nullable=True)
+    # Denormalized: True when current_version_id points at a full detail snapshot.
+    has_detail = Column(Boolean, nullable=False, default=False, index=True)
 
     versions = relationship("ListingVersion", back_populates="listing", foreign_keys="ListingVersion.listing_id")
     current_version = relationship("ListingVersion", foreign_keys=[current_version_id], post_update=True)
@@ -60,6 +62,8 @@ class ListingVersion(Base):
     image_urls = Column(Text)  # JSON
 
     data_hash = Column(Text, index=True)
+    # True for versions created from /inserat/{id}, /inserate-detailed, or cache-miss stores.
+    is_detail = Column(Boolean, nullable=False, default=False, index=True)
 
     listing = relationship("Listing", back_populates="versions", foreign_keys=[listing_id])
     images = relationship("Image", back_populates="version")

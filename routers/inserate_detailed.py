@@ -1,9 +1,13 @@
+import logging
 import time
 
 from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
 
 import database as db_module
 from storage import get_cached_detail, store_listing, store_listings_batch
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -62,8 +66,8 @@ async def get_inserate_detailed(
     )
     params["max_concurrent_details"] = max_concurrent_details
 
-    response = await client.get("/inserate-detailed", params=params)
-    data = response.json()
+    upstream_response, upstream_url = await client.get("/inserate-detailed", params=params)
+    data = upstream_response.json()
 
     if data.get("success") and data.get("data"):
         async with db_module.async_session() as session:
@@ -80,7 +84,10 @@ async def get_inserate_detailed(
                 if version_id and image_urls:
                     image_worker.enqueue(adid, listing_id, version_id, image_urls)
 
-    return data
+    return JSONResponse(
+        content=data,
+        headers={"X-Upstream-Used": upstream_url},
+    )
 
 
 @router.get("/inserate-detailed-cached")
@@ -120,20 +127,34 @@ async def get_inserate_detailed_cached(
     )
 
     # 1. Cheap search step.
-    search_resp = await client.get("/inserate", params=params)
+    search_resp, search_upstream = await client.get("/inserate", params=params)
     search_data = search_resp.json()
+
+    raw_cards = len(search_data.get("results") or []) if search_data.get("success") else 0
+    logger.info(
+        "Cached search received %d raw cards from upstream=%s (params: %s)",
+        raw_cards, search_upstream, {k: v for k, v in params.items() if k in ("query", "category", "location", "radius")}
+    )
+
     if not search_data.get("success"):
         # Pass the upstream failure through — keep the response shape the
         # same as /inserate-detailed (``data`` key) so callers don't have
         # to special-case.
-        return {
-            "success": False,
-            "data": [],
-            "unique_results": 0,
-            "time_taken": round(time.time() - t_start, 3),
-            "performance_metrics": {"cache_hits": 0, "cache_misses": 0},
-            "error": search_data.get("error") or "upstream search failed",
-        }
+        return JSONResponse(
+            content={
+                "success": False,
+                "data": [],
+                "unique_results": 0,
+                "time_taken": round(time.time() - t_start, 3),
+                "performance_metrics": {"cache_hits": 0, "cache_misses": 0},
+                "error": search_data.get("error") or "upstream search failed",
+            },
+            headers={
+                "X-Upstream-Used": search_upstream,
+                "X-Cache-Hits": "0",
+                "X-Cache-Misses": "0",
+            },
+        )
 
     cards = search_data.get("results") or []
 
@@ -141,9 +162,9 @@ async def get_inserate_detailed_cached(
     cache_hits = 0
     cache_misses = 0
 
-    # 2. Partition + fill.
+    # 2. Partition using a short-lived session (only for cache lookups).
+    need_fetch: list[dict] = []
     async with db_module.async_session() as session:
-        need_fetch: list[dict] = []
         for card in cards:
             adid = str(card.get("adid") or "")
             if not adid:
@@ -157,14 +178,8 @@ async def get_inserate_detailed_cached(
                     "title": card.get("title"),
                     "price": card.get("price"),
                     "description": card.get("description"),
-                    # Card-level posted_at — fresh on every search, persists
-                    # through to hunter so it can age-filter and display.
                     "posted_at": card.get("posted_at"),
                     "posted_at_raw": card.get("posted_at_raw"),
-                    # Card-level location/distance — used by the hunter to
-                    # drop nationwide-fallback responses.  Always re-read
-                    # from the card (not the cache) since these are part
-                    # of the search result, not the listing detail.
                     "location_zip": card.get("location_zip"),
                     "location_city": card.get("location_city"),
                     "distance_km": card.get("distance_km"),
@@ -174,59 +189,90 @@ async def get_inserate_detailed_cached(
             else:
                 need_fetch.append(card)
 
-        # 3. Fetch detail for misses, store, and merge.
-        async def _fetch_one(card: dict) -> dict | None:
-            adid = str(card.get("adid") or "")
-            if not adid:
-                return None
-            t0 = time.time()
-            try:
-                r = await client.get(f"/inserat/{adid}")
-                data = r.json()
-            except Exception:
-                return None
-            if not data.get("success") or not data.get("data"):
-                return None
-            detail = data["data"]
+    # 3. Fetch details for misses — NO DB session is held during network I/O.
+    #    This prevents long-held connections when upstreams are slow.
+    attempted_misses = len(need_fetch)
+    successful_details = 0
+    failed_details = 0
 
-            lid, version_id, is_new, image_urls = await store_listing(
-                session, detail, source="detail"
+    to_store: list[tuple[dict, dict, str]] = []  # (card, detail, upstream_used)
+
+    for card in need_fetch:
+        adid = str(card.get("adid") or "")
+        if not adid:
+            continue
+
+        t0 = time.time()
+
+        try:
+            response, upstream_used = await client.get(f"/inserat/{adid}")
+            data = response.json()
+        except Exception as exc:
+            logger.warning(
+                "Detail fetch failed for adid=%s (upstream=%s, error: %s)",
+                adid, "unknown", exc
             )
-            if lid and version_id and image_urls:
-                await image_worker.create_pending_records(
-                    session, lid, version_id, image_urls
+            failed_details += 1
+            continue
+
+        if not data.get("success") or not data.get("data"):
+            logger.warning(
+                "Detail response not successful for adid=%s (success=%s, has_data=%s)",
+                adid, data.get("success"), bool(data.get("data"))
+            )
+            failed_details += 1
+            continue
+
+        detail = data["data"]
+        to_store.append((card, detail, upstream_used))
+        successful_details += 1
+
+    if failed_details > 0:
+        logger.warning(
+            "Cached search failed to fetch full details for %d/%d cache-miss cards "
+            "(search_upstream=%s). These cards were dropped for this response. "
+            "Underlying API worker health for /inserat/{id} should be investigated.",
+            failed_details, attempted_misses, search_upstream,
+        )
+
+    # 4. Store successful details using a fresh short-lived session.
+    #    Network work is already complete, so the session is only held for DB work.
+    cache_misses = attempted_misses
+    fetched: list[dict] = []
+
+    if to_store:
+        async with db_module.async_session() as session:
+            for card, detail, upstream_used in to_store:
+                t0 = time.time()  # re-measure only the store part if desired
+                lid, version_id, is_new, image_urls = await store_listing(
+                    session, detail, source="detail"
                 )
-            return {
-                "adid": adid,
-                "url": card.get("url"),
-                "title": card.get("title"),
-                "price": card.get("price"),
-                "description": card.get("description"),
-                "posted_at": card.get("posted_at"),
-                "posted_at_raw": card.get("posted_at_raw"),
-                "location_zip": card.get("location_zip"),
-                "location_city": card.get("location_city"),
-                "distance_km": card.get("distance_km"),
-                "details": detail,
-                "detail_fetch_time": round(time.time() - t0, 3),
-                # Carry enqueue info so we can kick off image downloads
-                # after the session commits.  Stripped before the response
-                # is returned.
-                "_enqueue": (lid, version_id, image_urls) if (lid and version_id and image_urls) else None,
-            }
+                if lid and version_id and image_urls:
+                    await image_worker.create_pending_records(
+                        session, lid, version_id, image_urls
+                    )
 
-        # Sequential is fine — cache misses are the expensive step anyway
-        # and the upstream's own concurrency limiter protects against
-        # overloading the Playwright pool.
-        cache_misses = len(need_fetch)  # includes failed fetches, for observability
-        fetched: list[dict] = []
-        for card in need_fetch:
-            row = await _fetch_one(card)
-            if row is not None:
+                row = {
+                    "adid": str(card.get("adid")),
+                    "url": card.get("url"),
+                    "title": card.get("title"),
+                    "price": card.get("price"),
+                    "description": card.get("description"),
+                    "posted_at": card.get("posted_at"),
+                    "posted_at_raw": card.get("posted_at_raw"),
+                    "location_zip": card.get("location_zip"),
+                    "location_city": card.get("location_city"),
+                    "distance_km": card.get("distance_km"),
+                    "details": detail,
+                    "detail_fetch_time": round(time.time() - t0, 3),
+                    "_detail_upstream": upstream_used,
+                    "_enqueue": (lid, version_id, image_urls) if (lid and version_id and image_urls) else None,
+                }
                 fetched.append(row)
-        await session.commit()
 
-        # Enqueue image downloads after commit so workers see persisted rows.
+            await session.commit()
+
+        # Enqueue image downloads after commit.
         for row in fetched:
             enq = row.pop("_enqueue", None)
             if enq:
@@ -235,14 +281,31 @@ async def get_inserate_detailed_cached(
             combined.append(row)
 
     # Response shape mirrors /inserate-detailed.
-    return {
-        "success": True,
-        "data": combined,
-        "unique_results": len(combined),
-        "time_taken": round(time.time() - t_start, 3),
-        "performance_metrics": {
-            "cache_hits": cache_hits,
-            "cache_misses": cache_misses,
-            "pages_requested": page_count,
+    # For the cached variant we also expose cache effectiveness so callers
+    # (especially the hunter) can see how much came from local storage vs live
+    # upstream calls for this particular search.
+    return JSONResponse(
+        content={
+            "success": True,
+            "data": combined,
+            "unique_results": len(combined),
+            "time_taken": round(time.time() - t_start, 3),
+            "performance_metrics": {
+                "cache_hits": cache_hits,
+                "cache_misses": cache_misses,
+                "raw_cards_from_search": raw_cards,
+                "detail_fetch_attempts": attempted_misses,
+                "detail_fetch_successes": successful_details,
+                "detail_fetch_failures": failed_details,
+                "search_upstream": search_upstream,
+                "pages_requested": page_count,
+            },
         },
-    }
+        headers={
+            "X-Upstream-Used": search_upstream,
+            "X-Cache-Hits": str(cache_hits),
+            "X-Cache-Misses": str(cache_misses),
+            "X-Raw-Cards-From-Search": str(raw_cards),
+            "X-Detail-Failures": str(failed_details),
+        },
+    )

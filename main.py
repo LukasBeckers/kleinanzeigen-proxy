@@ -1,13 +1,14 @@
 import logging
 from contextlib import asynccontextmanager
 
-import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel, Field
 
 from config import settings
 from database import init_db
 from image_worker import ImageWorker
 from routers import inserate, inserat, inserate_detailed
+from upstream import LoadBalancedClient
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -15,15 +16,19 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
-    logger.info(f"Connecting to upstream API at {settings.api_base_url}")
+    urls = settings.upstream_urls
+    weights = settings.upstream_weights
+    logger.info(
+        "Connecting to upstream API(s): %s (weights=%s)",
+        ", ".join(urls),
+        weights,
+    )
 
     await init_db()
     logger.info("Database initialized")
 
-    app.state.upstream_client = httpx.AsyncClient(
-        base_url=settings.api_base_url,
-        timeout=300.0,
+    app.state.upstream_client = LoadBalancedClient(
+        urls, timeout=300.0, weights=weights
     )
 
     app.state.image_worker = ImageWorker()
@@ -48,6 +53,84 @@ app.include_router(inserate_detailed.router)
 async def root():
     return {
         "service": "kleinanzeigen-proxy",
-        "upstream": settings.api_base_url,
-        "endpoints": ["/inserate", "/inserat/{id}", "/inserate-detailed"],
+        "upstreams": settings.upstream_urls,
+        "endpoints": [
+            "/inserate",
+            "/inserat/{id}",
+            "/inserate-detailed",
+            "/inserate-detailed-cached",
+            "/upstream-stats",
+            "/upstream-seed",
+            "/upstream-weight",
+        ],
     }
+
+
+@app.get("/upstream-stats")
+async def upstream_stats(request: Request):
+    """Sliding-window success/failure counts and current pick probabilities.
+
+    Used by the kleinanzeigen-hunter admin panel to visualize load-balancer
+    health per downstream scraper worker.
+    """
+    client: LoadBalancedClient = request.app.state.upstream_client
+    return client.stats()
+
+
+class UpstreamSeedBody(BaseModel):
+    url: str = Field(..., min_length=1, description="Exact upstream base URL")
+    fail_rate: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Fraction of this worker's sliding window that should be failures "
+            "(0 = all success, 1 = all fail), in 5% steps"
+        ),
+    )
+
+
+@app.post("/upstream-seed")
+async def upstream_seed(body: UpstreamSeedBody, request: Request):
+    """Reseed one upstream's sliding window to a given failure rate.
+
+    Sets that worker's last-N outcomes so ``fail_rate`` of them are failures
+    (and the rest successes). Does not change other workers. Used by the
+    hunter admin panel after a recovered scraper was stuck at 0% pick weight.
+    """
+    client: LoadBalancedClient = request.app.state.upstream_client
+    try:
+        return client.seed_window_fail_rate(body.url, body.fail_rate)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+class UpstreamWeightBody(BaseModel):
+    url: str = Field(..., min_length=1, description="Exact upstream base URL")
+    weight: float = Field(
+        ...,
+        ge=0.0,
+        description=(
+            "Multiplicative pick weight (>= 0). With equal success windows, "
+            "P(i) ∝ weight_i."
+        ),
+    )
+
+
+@app.post("/upstream-weight")
+async def upstream_weight(body: UpstreamWeightBody, request: Request):
+    """Set the multiplicative pick weight for one upstream worker.
+
+    Pick probability is ``(successes_i * weight_i) / sum_j(...)``. Runtime
+    changes apply immediately; they do not rewrite ``API_BASE_WEIGHTS`` in
+    the environment (restart reloads env defaults).
+    """
+    client: LoadBalancedClient = request.app.state.upstream_client
+    try:
+        return client.set_weight(body.url, body.weight)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc

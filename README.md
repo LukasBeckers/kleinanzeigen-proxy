@@ -32,6 +32,7 @@ Three tables form the storage layer:
 | `first_seen_at` | DATETIME | When the listing was first encountered |
 | `last_seen_at` | DATETIME | Updated on every fetch (even without changes) |
 | `current_version_id` | TEXT (FK) | Points to the latest version |
+| `has_detail` | BOOLEAN | True when `current_version_id` is a full detail snapshot (not search-card only) |
 
 **`listing_versions`** - A new row is created only when listing content changes.
 
@@ -57,6 +58,7 @@ Three tables form the storage layer:
 | `extra_info` | TEXT (JSON) | Additional metadata |
 | `image_urls` | TEXT (JSON) | Original image URLs at time of fetch |
 | `data_hash` | TEXT | SHA256 hash for deduplication |
+| `is_detail` | BOOLEAN | True when this version came from a full `/inserat/{id}` (or equivalent) fetch |
 
 **`images`** - One row per downloaded image file.
 
@@ -79,6 +81,8 @@ Each listing version is hashed using SHA256 over a canonical JSON of all content
 1. If the `adid` is new: create a `listings` row + first `listing_versions` row
 2. If the `adid` exists and the hash matches the current version: only update `last_seen_at`
 3. If the `adid` exists but the hash differs: create a new `listing_versions` row and update `current_version_id`
+
+Concurrent cache misses for the same `adid` (e.g. several hunter jobs finishing detail fetches at once) use `INSERT OR IGNORE` on `listings.adid` so a lost race falls back to the existing row instead of returning HTTP 500.
 
 ## Prerequisites
 
@@ -110,17 +114,95 @@ If both services run on the same Docker network, use the container name instead:
 API_BASE_URL=http://kleinanzeigen-api:8000
 ```
 
+Multiple upstream API workers can be configured via `API_BASE_URLS` (comma-separated). The proxy load-balances across them using a **success-weighted** strategy with optional **multiplicative weights**:
+
+- Each upstream keeps the last **100** attempt outcomes (HTTP 2xx = success, anything else = failure).
+- Selection probability for upstream *i* is:
+
+  `P(i) = (successes_i · weight_i) / Σ_j (successes_j · weight_j)`
+
+  Example: both workers fully healthy, weights `1.5` and `1` → P = 60% / 40%.
+- On startup each upstream's window is pre-filled with successes (optimistic prior) so traffic starts evenly split (~50/50 for two workers with equal weights) until real failures displace them.
+- Connect timeout is **10s** (fail fast on offline hosts); read/write still use the full scrape budget (default 300s).
+- A long failure run can push a worker to **0% pick probability**. Admins can reseed its sliding window to a chosen **fail rate** — see `POST /upstream-seed` and the hunter Admin page (5% steps).
+- Weights default to `1` each. Set at boot via `API_BASE_WEIGHTS` (comma-separated, same order as URLs) or at runtime via `POST /upstream-weight` / the Admin UI.
+
+Example:
+
+```env
+API_BASE_URLS=http://host.docker.internal:8000,http://100.68.101.87:8001
+API_BASE_WEIGHTS=1.5,1
+```
+
+Distribution stats (pick counts and per-upstream success ratios) are logged every 50 requests.
+
+Live stats are also exposed as JSON for dashboards:
+
+```bash
+curl http://localhost:8001/upstream-stats
+```
+
+Response shape:
+
+```json
+{
+  "history_size": 100,
+  "total_requests": 42,
+  "upstreams": [
+    {
+      "url": "http://scraper-a:8000",
+      "successes": 95,
+      "failures": 5,
+      "window_size": 100,
+      "history_size": 100,
+      "weight": 1.5,
+      "probability": 0.66,
+      "pick_count": 28,
+      "outcomes": [true, true, false]
+    }
+  ]
+}
+```
+
+### Admin: reseed window fail rate
+
+When a worker is stuck at 0% pick weight after a long outage, reseed **that worker's** sliding window so a chosen fraction of the last N attempts are failures (rest successes), in 5% steps. Other workers are left alone; pick probability then follows from relative success counts.
+
+```bash
+curl -X POST http://localhost:8001/upstream-seed \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"http://100.68.101.87:8001","fail_rate":0.20}'
+```
+
+Example: `fail_rate: 0.20` on a history of 100 → 80 successes + 20 failures for that worker. Response is the usual stats payload plus a `seeded` diagnostic.
+
+`successes` / `failures` count outcomes in the sliding window. `outcomes` is the ordered list (oldest → newest, `true`=ok) for the timeline UI. `probability` is the current selection weight (`successes_i / sum(successes_j)`). kleinanzeigen-hunter's admin panel reads this via `PROXY_BASE_URL`.
+
 ### 3. Start the proxy
 
 ```bash
 docker compose up -d --build
 ```
 
+Runtime data (`proxy.db`, cached images) lives in `./data` on the host and is bind-mounted to `/data` in the container. `.dockerignore` excludes `data/` from the image build so rebuilds stay fast; the volume mount is unchanged.
+
 The proxy will be available at `http://localhost:8001`.
 
 ## API Endpoints
 
-All endpoints mirror the upstream API and return identical responses.
+Most endpoints mirror the upstream API and return identical responses. Operational endpoints (`/`, `/upstream-stats`, `/upstream-seed`) are proxy-only.
+
+### `GET /upstream-stats` - Load-balancer window + probabilities
+
+Returns the rolling success/failure window and current pick probability for every configured upstream worker. See the load-balancing section above for field definitions.
+
+### `POST /upstream-seed` - Reseed one worker's window fail rate
+
+Body: `{ "url": "<exact upstream base URL>", "fail_rate": 0.20 }` with `fail_rate` in 5% steps (0 = all success, 1 = all fail). Rewrites only that worker's sliding window. See the load-balancing section above.
+
+### `POST /upstream-weight` - Set multiplicative pick weight
+
+Body: `{ "url": "<exact upstream base URL>", "weight": 1.5 }` with `weight >= 0`. Applies immediately to pick probability; does not rewrite `.env` (restart reloads `API_BASE_WEIGHTS`).
 
 ### `GET /inserate` - Search listings
 
@@ -162,6 +244,20 @@ Same parameters as `/inserate`, plus:
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `max_concurrent_details` | int (1-10) | Concurrent detail fetches (default: 5) |
+
+### `GET /inserate-detailed-cached` - Search with cache-first details
+
+Same response shape as `/inserate-detailed`, but detail payloads are served from the proxy SQLite archive when available. Only cache misses call upstream `/inserat/{id}`.
+
+```bash
+curl "http://localhost:8001/inserate-detailed-cached?query=mofa&location=52538&radius=100&max_price=300"
+```
+
+The JSON body includes `performance_metrics` with `cache_hits`, `cache_misses`, `raw_cards_from_search`, and `search_upstream`. These measure **proxy-level** detail caching only.
+
+Detail cache hits require `listings.has_detail = true` (current version has `is_detail = true`). Search-card archival from `GET /inserate` stores versions with `is_detail = false`; only full detail fetches flip the flags. Imageless listings are cached after the first detail fetch (`image_urls = "[]"`).
+
+**Note for kleinanzeigen-hunter consumers:** `cache_hits` / `cache_misses` are unrelated to hunter's `new_count`. A run can scrape 25 listings (23 cache hits, 2 misses) yet show `new_count=0` when every adid was already seen by that job's `seen_listings` dedup. Cache hits mean "detail came from proxy storage"; `new_count` means "adid not yet processed under this job's pipeline hash".
 
 ## Data Access
 

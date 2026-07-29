@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
 
 import database as db_module
 from storage import store_listings_batch
@@ -41,11 +42,14 @@ async def get_inserate(
         params["attribute_filters"] = attribute_filters
     params["page_count"] = page_count
 
-    response = await client.get("/inserate", params=params)
-    data = response.json()
+    upstream_response, upstream_url = await client.get("/inserate", params=params)
+    data = upstream_response.json()
 
     if data.get("success") and data.get("results"):
         async with db_module.async_session() as session:
             await store_listings_batch(session, data["results"], source="search")
 
-    return data
+    return JSONResponse(
+        content=data,
+        headers={"X-Upstream-Used": upstream_url},
+    )
