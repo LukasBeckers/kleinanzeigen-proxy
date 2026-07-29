@@ -349,3 +349,47 @@ class TestLoadBalancedClient:
         client.seed_window_fail_rate("http://a:8000", 0.30)
         outcomes = list(client._outcomes["http://a:8000"])
         assert outcomes == [False] * 3 + [True] * 7
+
+    def test_configured_weight_biases_pick_when_both_healthy(self):
+        """Equal success windows + weights 1.5 vs 1 → P = 1.5/2.5 = 0.6."""
+        client = LoadBalancedClient(
+            ["http://a:8000", "http://b:8000"],
+            timeout=1.0,
+            history_size=100,
+            weights=[1.5, 1.0],
+        )
+        # Both still at optimistic all-success prior.
+        probs = client._probabilities()
+        assert probs["http://a:8000"] == pytest.approx(1.5 / 2.5)
+        assert probs["http://b:8000"] == pytest.approx(1.0 / 2.5)
+        snap = client.stats()
+        by_url = {u["url"]: u for u in snap["upstreams"]}
+        assert by_url["http://a:8000"]["weight"] == 1.5
+        assert by_url["http://b:8000"]["weight"] == 1.0
+
+    def test_set_weight_updates_probabilities(self):
+        client = LoadBalancedClient(
+            ["http://a:8000", "http://b:8000"], timeout=1.0, weights=[1.0, 1.0]
+        )
+        result = client.set_weight("http://a:8000", 3.0)
+        assert result["weight_updated"]["weight"] == 3.0
+        probs = client._probabilities()
+        assert probs["http://a:8000"] == pytest.approx(3.0 / 4.0)
+        assert probs["http://b:8000"] == pytest.approx(1.0 / 4.0)
+
+    def test_weight_zero_excludes_upstream_from_picks(self):
+        client = LoadBalancedClient(
+            ["http://a:8000", "http://b:8000"], timeout=1.0, weights=[1.0, 0.0]
+        )
+        probs = client._probabilities()
+        assert probs["http://a:8000"] == pytest.approx(1.0)
+        assert probs["http://b:8000"] == pytest.approx(0.0)
+        random.seed(0)
+        picks = [client._pick_upstream() for _ in range(50)]
+        assert all(p == "http://a:8000" for p in picks)
+
+    def test_weights_length_must_match_urls(self):
+        with pytest.raises(ValueError, match="weights length"):
+            LoadBalancedClient(
+                ["http://a:8000", "http://b:8000"], timeout=1.0, weights=[1.0]
+            )

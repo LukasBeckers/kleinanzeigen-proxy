@@ -17,12 +17,19 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     urls = settings.upstream_urls
-    logger.info(f"Connecting to upstream API(s): {', '.join(urls)}")
+    weights = settings.upstream_weights
+    logger.info(
+        "Connecting to upstream API(s): %s (weights=%s)",
+        ", ".join(urls),
+        weights,
+    )
 
     await init_db()
     logger.info("Database initialized")
 
-    app.state.upstream_client = LoadBalancedClient(urls, timeout=300.0)
+    app.state.upstream_client = LoadBalancedClient(
+        urls, timeout=300.0, weights=weights
+    )
 
     app.state.image_worker = ImageWorker()
     await app.state.image_worker.start()
@@ -54,6 +61,7 @@ async def root():
             "/inserate-detailed-cached",
             "/upstream-stats",
             "/upstream-seed",
+            "/upstream-weight",
         ],
     }
 
@@ -93,6 +101,35 @@ async def upstream_seed(body: UpstreamSeedBody, request: Request):
     client: LoadBalancedClient = request.app.state.upstream_client
     try:
         return client.seed_window_fail_rate(body.url, body.fail_rate)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+class UpstreamWeightBody(BaseModel):
+    url: str = Field(..., min_length=1, description="Exact upstream base URL")
+    weight: float = Field(
+        ...,
+        ge=0.0,
+        description=(
+            "Multiplicative pick weight (>= 0). With equal success windows, "
+            "P(i) ∝ weight_i."
+        ),
+    )
+
+
+@app.post("/upstream-weight")
+async def upstream_weight(body: UpstreamWeightBody, request: Request):
+    """Set the multiplicative pick weight for one upstream worker.
+
+    Pick probability is ``(successes_i * weight_i) / sum_j(...)``. Runtime
+    changes apply immediately; they do not rewrite ``API_BASE_WEIGHTS`` in
+    the environment (restart reloads env defaults).
+    """
+    client: LoadBalancedClient = request.app.state.upstream_client
+    try:
+        return client.set_weight(body.url, body.weight)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:

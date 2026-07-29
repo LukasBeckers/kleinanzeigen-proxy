@@ -114,18 +114,24 @@ If both services run on the same Docker network, use the container name instead:
 API_BASE_URL=http://kleinanzeigen-api:8000
 ```
 
-Multiple upstream API workers can be configured via `API_BASE_URLS` (comma-separated). The proxy load-balances across them using a **success-weighted** strategy:
+Multiple upstream API workers can be configured via `API_BASE_URLS` (comma-separated). The proxy load-balances across them using a **success-weighted** strategy with optional **multiplicative weights**:
 
 - Each upstream keeps the last **100** attempt outcomes (HTTP 2xx = success, anything else = failure).
-- Selection probability for upstream *i* is `successes_i / sum(successes_j)` over those windows.
-- On startup each upstream's window is pre-filled with successes (optimistic prior) so traffic starts evenly split (~50/50 for two workers) until real failures displace them.
+- Selection probability for upstream *i* is:
+
+  `P(i) = (successes_i · weight_i) / Σ_j (successes_j · weight_j)`
+
+  Example: both workers fully healthy, weights `1.5` and `1` → P = 60% / 40%.
+- On startup each upstream's window is pre-filled with successes (optimistic prior) so traffic starts evenly split (~50/50 for two workers with equal weights) until real failures displace them.
 - Connect timeout is **10s** (fail fast on offline hosts); read/write still use the full scrape budget (default 300s).
-- A long failure run can push a worker to **0% pick probability**. Admins can reseed its sliding window to a chosen **fail rate** (fraction of the last N attempts marked failed) — see `POST /upstream-seed` and the hunter Admin page (5% steps).
+- A long failure run can push a worker to **0% pick probability**. Admins can reseed its sliding window to a chosen **fail rate** — see `POST /upstream-seed` and the hunter Admin page (5% steps).
+- Weights default to `1` each. Set at boot via `API_BASE_WEIGHTS` (comma-separated, same order as URLs) or at runtime via `POST /upstream-weight` / the Admin UI.
 
 Example:
 
 ```env
 API_BASE_URLS=http://host.docker.internal:8000,http://100.68.101.87:8001
+API_BASE_WEIGHTS=1.5,1
 ```
 
 Distribution stats (pick counts and per-upstream success ratios) are logged every 50 requests.
@@ -149,8 +155,10 @@ Response shape:
       "failures": 5,
       "window_size": 100,
       "history_size": 100,
+      "weight": 1.5,
       "probability": 0.66,
-      "pick_count": 28
+      "pick_count": 28,
+      "outcomes": [true, true, false]
     }
   ]
 }
@@ -191,6 +199,10 @@ Returns the rolling success/failure window and current pick probability for ever
 ### `POST /upstream-seed` - Reseed one worker's window fail rate
 
 Body: `{ "url": "<exact upstream base URL>", "fail_rate": 0.20 }` with `fail_rate` in 5% steps (0 = all success, 1 = all fail). Rewrites only that worker's sliding window. See the load-balancing section above.
+
+### `POST /upstream-weight` - Set multiplicative pick weight
+
+Body: `{ "url": "<exact upstream base URL>", "weight": 1.5 }` with `weight >= 0`. Applies immediately to pick probability; does not rewrite `.env` (restart reloads `API_BASE_WEIGHTS`).
 
 ### `GET /inserate` - Search listings
 

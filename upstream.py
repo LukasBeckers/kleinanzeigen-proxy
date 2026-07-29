@@ -23,11 +23,25 @@ class LoadBalancedClient:
         *,
         history_size: int = _HISTORY_SIZE,
         connect_timeout: float = _CONNECT_TIMEOUT,
+        weights: list[float] | None = None,
     ):
         self._urls = list(urls)
         self._timeout = timeout
         self._connect_timeout = connect_timeout
         self._history_size = history_size
+        if weights is None:
+            weight_list = [1.0] * len(self._urls)
+        else:
+            if len(weights) != len(self._urls):
+                raise ValueError(
+                    f"weights length {len(weights)} != urls length {len(self._urls)}"
+                )
+            weight_list = [float(w) for w in weights]
+            if any(w < 0 for w in weight_list):
+                raise ValueError("weights must be >= 0")
+        self._weights: dict[str, float] = {
+            url: weight_list[i] for i, url in enumerate(self._urls)
+        }
         # httpx: short connect timeout so offline workers don't block for
         # the full scrape budget; read/write use the caller's timeout.
         client_timeout = httpx.Timeout(
@@ -62,27 +76,52 @@ class LoadBalancedClient:
     def _failure_count(self, url: str) -> int:
         return sum(1 for ok in self._outcomes[url] if not ok)
 
+    def _weighted_score(self, url: str) -> float:
+        """successes × configured multiplicative weight."""
+        return self._success_count(url) * self._weights[url]
+
     def _probabilities(self) -> dict[str, float]:
         """Selection probabilities matching ``_pick_upstream`` weights.
 
-        P(i) = successes_i / sum(successes_j). When every upstream has
-        zero successes in its window the picker uses equal shares (1/N)
-        so dashboards stay well-defined and random.choices stays valid.
+        P(i) = (successes_i · weight_i) / sum_j(successes_j · weight_j).
+
+        When every upstream has zero successes, fall back to pure configured
+        weights (or equal 1/N if all weights are zero) so dashboards and
+        random.choices stay well-defined.
         """
         if not self._urls:
             return {}
-        success_counts = {url: self._success_count(url) for url in self._urls}
-        total = sum(success_counts.values())
-        if total == 0:
-            equal = 1.0 / len(self._urls)
-            return {url: equal for url in self._urls}
-        return {url: success_counts[url] / total for url in self._urls}
+        scores = {url: self._weighted_score(url) for url in self._urls}
+        total = sum(scores.values())
+        if total > 0:
+            return {url: scores[url] / total for url in self._urls}
+        # No successes in any window — use configured weights alone.
+        wsum = sum(self._weights[url] for url in self._urls)
+        if wsum > 0:
+            return {url: self._weights[url] / wsum for url in self._urls}
+        equal = 1.0 / len(self._urls)
+        return {url: equal for url in self._urls}
+
+    def set_weight(self, url: str, weight: float) -> dict:
+        """Update the multiplicative pick weight for one upstream."""
+        if url not in self._weights:
+            raise KeyError(f"unknown upstream: {url}")
+        w = float(weight)
+        if w < 0:
+            raise ValueError("weight must be >= 0")
+        self._weights[url] = w
+        logger.info("Set upstream %s weight=%.4g; pick P=%.1f%%",
+                    url, w, self._probabilities()[url] * 100)
+        result = self.stats()
+        result["weight_updated"] = {"url": url, "weight": w}
+        return result
 
     def stats(self) -> dict:
         """Snapshot of sliding-window outcomes and current pick probabilities.
 
         Each upstream includes ``outcomes``: ordered booleans (oldest → newest)
-        so the admin UI can render a per-attempt timeline (green=ok, red=fail).
+        so the admin UI can render a per-attempt timeline (green=ok, red=fail),
+        plus the configured multiplicative ``weight``.
         """
         probs = self._probabilities()
         upstreams = []
@@ -99,6 +138,7 @@ class LoadBalancedClient:
                     "failures": failures,
                     "window_size": window,
                     "history_size": self._history_size,
+                    "weight": self._weights[url],
                     "probability": probs[url],
                     "pick_count": self._request_counts.get(url, 0),
                     "outcomes": outcomes,
@@ -180,21 +220,21 @@ class LoadBalancedClient:
         return result
 
     def _pick_upstream(self) -> str:
-        """Weighted pick: P(i) = successes_i / sum(successes_j).
+        """Weighted pick: P(i) = (successes_i · weight_i) / Σ (successes_j · weight_j).
 
         Each upstream keeps the last ``history_size`` attempt outcomes
-        (success or failure). Only successes contribute weight. Histories
-        are initialised to all-success so new proxies start with equal
-        weights per upstream. When every window is all-fail, pick uniformly.
+        (success or failure). Successes contribute weight, scaled by the
+        configured multiplicative ``weight`` (default 1). Histories are
+        initialised to all-success so new proxies start even (modulo weights).
+        When every window is all-fail, pick by configured weights alone.
         """
         if len(self._urls) == 1:
             return self._urls[0]
 
-        success_counts = {url: self._success_count(url) for url in self._urls}
-        total = sum(success_counts.values())
-        if total == 0:
+        probs = self._probabilities()
+        weights = [probs[url] for url in self._urls]
+        if sum(weights) <= 0:
             return random.choice(self._urls)
-        weights = [success_counts[url] for url in self._urls]
         return random.choices(self._urls, weights=weights, k=1)[0]
 
     def _record_outcome(self, url: str, success: bool) -> None:
@@ -230,11 +270,13 @@ class LoadBalancedClient:
         Selection uses the last ``history_size`` attempt outcomes per upstream.
         Probability of picking upstream *i* is::
 
-            successes_i / sum(successes_j for all j)
+            (successes_i · weight_i) / sum_j(successes_j · weight_j)
 
-        where *successes* counts HTTP 2xx completions in that upstream's window.
-        Failed attempts are recorded but add no weight. Each upstream's window
-        is pre-filled with successes so traffic starts evenly split.
+        where *successes* counts HTTP 2xx completions in that upstream's window
+        and *weight* is a configurable multiplicative bias (default 1).
+        Failed attempts are recorded but add no success mass. Each upstream's
+        window is pre-filled with successes so traffic starts evenly split
+        (modulo weights).
 
         Admins can reseed a window via ``seed_window_fail_rate`` (proxy
         ``POST /upstream-seed``) so a recovered worker's history is not
