@@ -284,8 +284,8 @@ class TestLoadBalancedClient:
         assert probs["http://b:8000"] == pytest.approx(0.0)
         assert probs["http://a:8000"] == pytest.approx(1.0)
 
-    def test_seed_window_fail_rate_sets_success_fail_counts(self):
-        """Admin reseed sets this worker's window fail fraction only."""
+    def test_seed_window_success_rate_sets_success_fail_counts(self):
+        """Admin reseed sets this worker's window success fraction only."""
         client = LoadBalancedClient(
             ["http://a:8000", "http://b:8000"],
             timeout=1.0,
@@ -296,38 +296,38 @@ class TestLoadBalancedClient:
         client._outcomes["http://b:8000"].clear()
         client._outcomes["http://b:8000"].extend([False] * 100)
 
-        # 20% fail → 80 ok / 20 fail; pick weight = 80/(100+80) ≈ 44.4%
-        result = client.seed_window_fail_rate("http://b:8000", 0.20)
+        # 80% success → 80 ok / 20 fail; pick weight = 80/(100+80) ≈ 44.4%
+        result = client.seed_window_success_rate("http://b:8000", 0.80)
         by_url = {u["url"]: u for u in result["upstreams"]}
         assert by_url["http://b:8000"]["successes"] == 80
         assert by_url["http://b:8000"]["failures"] == 20
         assert by_url["http://a:8000"]["successes"] == 100  # untouched
-        assert result["seeded"]["requested_fail_rate"] == 0.20
-        assert result["seeded"]["actual_fail_rate"] == pytest.approx(0.20)
+        assert result["seeded"]["requested_success_rate"] == 0.80
+        assert result["seeded"]["actual_success_rate"] == pytest.approx(0.80)
         assert by_url["http://b:8000"]["probability"] == pytest.approx(80 / 180)
 
-    def test_seed_window_fail_rate_zero_and_full(self):
+    def test_seed_window_success_rate_zero_and_full(self):
         client = LoadBalancedClient(
             ["http://a:8000", "http://b:8000"], timeout=1.0, history_size=100
         )
-        client.seed_window_fail_rate("http://b:8000", 0.0)
+        client.seed_window_success_rate("http://b:8000", 1.0)
         assert client._success_count("http://b:8000") == 100
         assert client._failure_count("http://b:8000") == 0
 
-        client.seed_window_fail_rate("http://b:8000", 1.0)
+        client.seed_window_success_rate("http://b:8000", 0.0)
         assert client._success_count("http://b:8000") == 0
         assert client._failure_count("http://b:8000") == 100
 
-    def test_seed_rejects_unknown_url_and_off_grid_fail_rate(self):
+    def test_seed_rejects_unknown_url_and_off_grid_success_rate(self):
         client = LoadBalancedClient(
             ["http://a:8000", "http://b:8000"], timeout=1.0, history_size=100
         )
         with pytest.raises(KeyError):
-            client.seed_window_fail_rate("http://missing:8000", 0.5)
+            client.seed_window_success_rate("http://missing:8000", 0.5)
         with pytest.raises(ValueError, match="multiple of"):
-            client.seed_window_fail_rate("http://a:8000", 0.33)
+            client.seed_window_success_rate("http://a:8000", 0.33)
         with pytest.raises(ValueError, match="between 0 and 1"):
-            client.seed_window_fail_rate("http://a:8000", 1.5)
+            client.seed_window_success_rate("http://a:8000", 1.5)
 
     def test_stats_outcomes_are_oldest_to_newest(self):
         client = LoadBalancedClient(
@@ -346,7 +346,8 @@ class TestLoadBalancedClient:
         client = LoadBalancedClient(
             ["http://a:8000"], timeout=1.0, history_size=10
         )
-        client.seed_window_fail_rate("http://a:8000", 0.30)
+        # 70% success → 7 ok / 3 fail (fails older, successes newer)
+        client.seed_window_success_rate("http://a:8000", 0.70)
         outcomes = list(client._outcomes["http://a:8000"])
         assert outcomes == [False] * 3 + [True] * 7
 
