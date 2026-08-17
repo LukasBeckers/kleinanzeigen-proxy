@@ -3,7 +3,19 @@ import random
 import httpx
 import pytest
 
-from upstream import LoadBalancedClient
+from upstream import AttemptOutcome, LoadBalancedClient
+
+
+def _ok(**kwargs) -> AttemptOutcome:
+    return AttemptOutcome(ok=True, **kwargs)
+
+
+def _fail(**kwargs) -> AttemptOutcome:
+    return AttemptOutcome(ok=False, **kwargs)
+
+
+def _flags(*oks: bool) -> list[AttemptOutcome]:
+    return [AttemptOutcome(ok=ok) for ok in oks]
 
 
 class TestLoadBalancedClient:
@@ -101,8 +113,8 @@ class TestLoadBalancedClient:
                 transport=httpx.MockTransport(make_handler(url)),
             )
 
-        client._outcomes["http://a:8000"].extend([True] * 50)
-        client._outcomes["http://b:8000"].extend([True] * 50)
+        client._outcomes["http://a:8000"].extend([_ok() for _ in range(50)])
+        client._outcomes["http://b:8000"].extend([_ok() for _ in range(50)])
 
         random.seed(12345)
         n_calls = 200
@@ -141,9 +153,9 @@ class TestLoadBalancedClient:
 
         # Seed: A 80 ok, B 20 ok → ~80% traffic to A under pure success weights.
         client._outcomes["http://a:8000"].clear()
-        client._outcomes["http://a:8000"].extend([True] * 80 + [False] * 20)
+        client._outcomes["http://a:8000"].extend(_flags(*([True] * 80 + [False] * 20)))
         client._outcomes["http://b:8000"].clear()
-        client._outcomes["http://b:8000"].extend([True] * 20 + [False] * 80)
+        client._outcomes["http://b:8000"].extend(_flags(*([True] * 20 + [False] * 80)))
 
         random.seed(99)
         n_calls = 500
@@ -175,8 +187,9 @@ class TestLoadBalancedClient:
             await client.get("/inserate")
 
         outcomes = list(client._outcomes["http://a:8000"])
-        assert outcomes[-1] is False
-        assert outcomes.count(False) == 1
+        assert outcomes[-1].ok is False
+        assert outcomes[-1].error
+        assert sum(1 for o in outcomes if not o.ok) == 1
         assert client._success_count("http://a:8000") == 99
 
         await client.aclose()
@@ -240,9 +253,9 @@ class TestLoadBalancedClient:
             ["http://a:8000", "http://b:8000"], timeout=1.0, history_size=100
         )
         client._outcomes["http://a:8000"].clear()
-        client._outcomes["http://a:8000"].extend([True] * 80 + [False] * 20)
+        client._outcomes["http://a:8000"].extend(_flags(*([True] * 80 + [False] * 20)))
         client._outcomes["http://b:8000"].clear()
-        client._outcomes["http://b:8000"].extend([True] * 20 + [False] * 80)
+        client._outcomes["http://b:8000"].extend(_flags(*([True] * 20 + [False] * 80)))
 
         snap = client.stats()
         by_url = {u["url"]: u for u in snap["upstreams"]}
@@ -258,9 +271,9 @@ class TestLoadBalancedClient:
             ["http://a:8000", "http://b:8000"], timeout=1.0, history_size=10
         )
         client._outcomes["http://a:8000"].clear()
-        client._outcomes["http://a:8000"].extend([False] * 10)
+        client._outcomes["http://a:8000"].extend(_flags(*([False] * 10)))
         client._outcomes["http://b:8000"].clear()
-        client._outcomes["http://b:8000"].extend([False] * 10)
+        client._outcomes["http://b:8000"].extend(_flags(*([False] * 10)))
 
         snap = client.stats()
         for row in snap["upstreams"]:
@@ -276,9 +289,9 @@ class TestLoadBalancedClient:
             history_size=100,
         )
         client._outcomes["http://a:8000"].clear()
-        client._outcomes["http://a:8000"].extend([True] * 100)
+        client._outcomes["http://a:8000"].extend(_flags(*([True] * 100)))
         client._outcomes["http://b:8000"].clear()
-        client._outcomes["http://b:8000"].extend([False] * 100)
+        client._outcomes["http://b:8000"].extend(_flags(*([False] * 100)))
 
         probs = client._probabilities()
         assert probs["http://b:8000"] == pytest.approx(0.0)
@@ -292,9 +305,9 @@ class TestLoadBalancedClient:
             history_size=100,
         )
         client._outcomes["http://a:8000"].clear()
-        client._outcomes["http://a:8000"].extend([True] * 100)
+        client._outcomes["http://a:8000"].extend(_flags(*([True] * 100)))
         client._outcomes["http://b:8000"].clear()
-        client._outcomes["http://b:8000"].extend([False] * 100)
+        client._outcomes["http://b:8000"].extend(_flags(*([False] * 100)))
 
         # 80% success → 80 ok / 20 fail; pick weight = 80/(100+80) ≈ 44.4%
         result = client.seed_window_success_rate("http://b:8000", 0.80)
@@ -336,9 +349,9 @@ class TestLoadBalancedClient:
         client._outcomes["http://a:8000"].clear()
         # Append in time order: oldest first
         for ok in (True, True, False, True, False):
-            client._outcomes["http://a:8000"].append(ok)
+            client._outcomes["http://a:8000"].append(AttemptOutcome(ok=ok))
         snap = client.stats()
-        assert snap["upstreams"][0]["outcomes"] == [
+        assert [o["ok"] for o in snap["upstreams"][0]["outcomes"]] == [
             True, True, False, True, False
         ]
 
@@ -349,7 +362,9 @@ class TestLoadBalancedClient:
         # 70% success → 7 ok / 3 fail (fails older, successes newer)
         client.seed_window_success_rate("http://a:8000", 0.70)
         outcomes = list(client._outcomes["http://a:8000"])
-        assert outcomes == [False] * 3 + [True] * 7
+        assert [o.ok for o in outcomes] == [False] * 3 + [True] * 7
+        assert all(o.error == "seeded" for o in outcomes)
+        assert all(o.duration_s is None for o in outcomes)
 
     def test_configured_weight_biases_pick_when_both_healthy(self):
         """Equal success windows + weights 1.5 vs 1 → P = 1.5/2.5 = 0.6."""
@@ -394,3 +409,99 @@ class TestLoadBalancedClient:
             LoadBalancedClient(
                 ["http://a:8000", "http://b:8000"], timeout=1.0, weights=[1.0]
             )
+
+    @pytest.mark.asyncio
+    async def test_records_duration_and_error_on_failure(self):
+        def handler(req: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("down")
+
+        client = LoadBalancedClient(["http://a:8000"], timeout=1.0, history_size=5)
+        client._clients["http://a:8000"] = httpx.AsyncClient(
+            base_url="http://a:8000",
+            transport=httpx.MockTransport(handler),
+        )
+        with pytest.raises(httpx.ConnectError):
+            await client.get("/inserate")
+        last = client._outcomes["http://a:8000"][-1]
+        assert last.ok is False
+        assert last.duration_s is not None and last.duration_s >= 0
+        assert "down" in (last.error or "")
+        snap = client.stats()["upstreams"][0]["outcomes"][-1]
+        assert snap["ok"] is False
+        assert snap["duration_s"] == last.duration_s
+        assert "down" in (snap["error"] or "")
+        await client.aclose()
+
+    @pytest.mark.asyncio
+    async def test_records_duration_on_success_and_browser_headers(self):
+        def handler(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={"success": True},
+                headers={
+                    "X-Recycle-Every": "250",
+                    "X-Requests-Since-Recycle": "12",
+                    "X-Recycle-Count": "3",
+                },
+            )
+
+        client = LoadBalancedClient(["http://a:8000"], timeout=1.0, history_size=3)
+        client._clients["http://a:8000"] = httpx.AsyncClient(
+            base_url="http://a:8000",
+            transport=httpx.MockTransport(handler),
+        )
+        await client.get("/inserate")
+        last = client._outcomes["http://a:8000"][-1]
+        assert last.ok is True
+        assert last.duration_s is not None and last.duration_s >= 0
+        assert last.error is None
+        row = client.stats()["upstreams"][0]
+        assert row["recycle_every"] == 250
+        assert row["requests_since_recycle"] == 12
+        assert row["recycle_count"] == 3
+        await client.aclose()
+
+    @pytest.mark.asyncio
+    async def test_set_recycle_every_posts_to_worker(self):
+        seen = {}
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            seen["method"] = req.method
+            seen["path"] = req.url.path
+            seen["body"] = req.content
+            return httpx.Response(
+                200,
+                json={
+                    "browser": {
+                        "recycle_every": 100,
+                        "requests_since_recycle": 4,
+                        "recycle_count": 1,
+                    }
+                },
+            )
+
+        client = LoadBalancedClient(["http://a:8000"], timeout=1.0)
+        client._clients["http://a:8000"] = httpx.AsyncClient(
+            base_url="http://a:8000",
+            transport=httpx.MockTransport(handler),
+        )
+        result = await client.set_recycle_every("http://a:8000", 100)
+        assert seen["method"] == "POST"
+        assert seen["path"] == "/browser/recycle-every"
+        assert result["recycle_updated"] == {
+            "url": "http://a:8000",
+            "recycle_every": 100,
+        }
+        row = {u["url"]: u for u in result["upstreams"]}["http://a:8000"]
+        assert row["recycle_every"] == 100
+        assert row["requests_since_recycle"] == 4
+        await client.aclose()
+
+    @pytest.mark.asyncio
+    async def test_set_recycle_every_rejects_unknown_url_and_non_positive(self):
+        client = LoadBalancedClient(["http://a:8000"], timeout=1.0)
+        with pytest.raises(KeyError):
+            await client.set_recycle_every("http://missing:8000", 10)
+        with pytest.raises(ValueError, match=">= 1"):
+            await client.set_recycle_every("http://a:8000", 0)
+        await client.aclose()

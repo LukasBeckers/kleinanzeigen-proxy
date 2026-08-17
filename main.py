@@ -62,6 +62,7 @@ async def root():
             "/upstream-stats",
             "/upstream-seed",
             "/upstream-weight",
+            "/upstream-recycle",
         ],
     }
 
@@ -135,3 +136,33 @@ async def upstream_weight(body: UpstreamWeightBody, request: Request):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+class UpstreamRecycleBody(BaseModel):
+    url: str = Field(..., min_length=1, description="Exact upstream base URL")
+    recycle_every: int = Field(
+        ...,
+        ge=1,
+        description="Recycle Playwright Chromium after this many scrape operations",
+    )
+
+
+@app.post("/upstream-recycle")
+async def upstream_recycle(body: UpstreamRecycleBody, request: Request):
+    """Set one worker's Chromium recycle interval (scrape-count, not a timer).
+
+    Forwards to that worker's ``POST /browser/recycle-every``. Runtime only;
+    does not rewrite the worker's ``BROWSER_RECYCLE_EVERY`` env.
+    """
+    client: LoadBalancedClient = request.app.state.upstream_client
+    try:
+        return await client.set_recycle_every(body.url, body.recycle_every)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"worker {body.url} unreachable or rejected recycle update: {exc}",
+        ) from exc

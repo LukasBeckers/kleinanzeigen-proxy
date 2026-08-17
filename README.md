@@ -158,11 +158,21 @@ Response shape:
       "weight": 1.5,
       "probability": 0.66,
       "pick_count": 28,
-      "outcomes": [true, true, false]
+      "recycle_every": 10000,
+      "requests_since_recycle": 12,
+      "recycle_count": 3,
+      "outcomes": [
+        {"ok": true, "duration_s": 1.24, "error": null},
+        {"ok": false, "duration_s": 12.4, "error": "ReadTimeout"}
+      ]
     }
   ]
 }
 ```
+
+`outcomes` is oldest → newest. `duration_s` / `error` are `null` for synthetic
+slots (optimistic prior or admin seed). Recycle fields come from the worker's
+`X-Recycle-*` response headers (or the last `POST /upstream-recycle`).
 
 ### Admin: reseed window success rate
 
@@ -199,6 +209,18 @@ Returns the rolling success/failure window and current pick probability for ever
 ### `POST /upstream-seed` - Reseed one worker's window success rate
 
 Body: `{ "url": "<exact upstream base URL>", "success_rate": 0.80 }` with `success_rate` in 5% steps (0 = all fail, 1 = all success). Rewrites only that worker's sliding window. See the load-balancing section above.
+
+### `POST /upstream-recycle` - Set one worker's Chromium recycle interval
+
+Body: `{ "url": "<exact upstream base URL>", "recycle_every": 500 }` with
+`recycle_every >= 1`. Forwards to that worker's `POST /browser/recycle-every`.
+Runtime only; does not rewrite the worker's env.
+
+```bash
+curl -X POST http://localhost:8001/upstream-recycle \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"http://100.68.101.87:8001","recycle_every":500}'
+```
 
 ### `POST /upstream-weight` - Set multiplicative pick weight
 

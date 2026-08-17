@@ -1,6 +1,8 @@
 import logging
 import random
+import time
 from collections import deque
+from dataclasses import dataclass
 
 import httpx
 
@@ -8,6 +10,33 @@ logger = logging.getLogger(__name__)
 
 # Admin seed UI offers this step size (0%, 5%, …, 100%).
 PROBABILITY_STEP = 0.05
+
+# Headers the scraper may attach so the admin UI can show recycle state
+# without an extra round-trip to a possibly hung worker.
+HEADER_RECYCLE_EVERY = "x-recycle-every"
+HEADER_REQUESTS_SINCE_RECYCLE = "x-requests-since-recycle"
+HEADER_RECYCLE_COUNT = "x-recycle-count"
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptOutcome:
+    """One proxy→worker attempt in the sliding window."""
+
+    ok: bool
+    duration_s: float | None = None
+    error: str | None = None
+
+    def to_json(self) -> dict:
+        return {
+            "ok": self.ok,
+            "duration_s": self.duration_s,
+            "error": self.error,
+        }
+
+
+def _synthetic_outcome(ok: bool, *, error: str | None = None) -> AttemptOutcome:
+    """Window filler (optimistic prior or admin seed) — no real timing."""
+    return AttemptOutcome(ok=ok, duration_s=None, error=error)
 
 
 class LoadBalancedClient:
@@ -59,22 +88,27 @@ class LoadBalancedClient:
         # Optimistic prior: each upstream starts with a full window of
         # successes so selection is 50/50 (or 1/N) until real outcomes
         # displace them.  Avoids one lucky first pick monopolizing traffic.
-        self._outcomes: dict[str, deque[bool]] = {
-            url: deque([True] * history_size, maxlen=history_size)
+        self._outcomes: dict[str, deque[AttemptOutcome]] = {
+            url: deque(
+                [_synthetic_outcome(True) for _ in range(history_size)],
+                maxlen=history_size,
+            )
             for url in self._urls
         }
         self._request_counts: dict[str, int] = {url: 0 for url in self._urls}
         self._total_requests = 0
+        # Last recycle stats seen on a worker response (headers or setter).
+        self._browser_info: dict[str, dict] = {url: {} for url in self._urls}
 
     @property
     def urls(self) -> list[str]:
         return list(self._urls)
 
     def _success_count(self, url: str) -> int:
-        return sum(1 for ok in self._outcomes[url] if ok)
+        return sum(1 for o in self._outcomes[url] if o.ok)
 
     def _failure_count(self, url: str) -> int:
-        return sum(1 for ok in self._outcomes[url] if not ok)
+        return sum(1 for o in self._outcomes[url] if not o.ok)
 
     def _weighted_score(self, url: str) -> float:
         """successes × configured multiplicative weight."""
@@ -119,9 +153,10 @@ class LoadBalancedClient:
     def stats(self) -> dict:
         """Snapshot of sliding-window outcomes and current pick probabilities.
 
-        Each upstream includes ``outcomes``: ordered booleans (oldest → newest)
-        so the admin UI can render a per-attempt timeline (green=ok, red=fail),
-        plus the configured multiplicative ``weight``.
+        Each upstream includes ``outcomes``: ordered attempt records
+        (oldest → newest) so the admin UI can render a per-attempt timeline
+        (green=ok, red=fail, bar height ∝ log duration), plus the configured
+        multiplicative ``weight`` and last-seen recycle stats.
         """
         probs = self._probabilities()
         upstreams = []
@@ -130,7 +165,8 @@ class LoadBalancedClient:
             failures = self._failure_count(url)
             window = len(self._outcomes[url])
             # Oldest first so left side of the bar is the past.
-            outcomes = list(self._outcomes[url])
+            outcomes = [o.to_json() for o in self._outcomes[url]]
+            info = self._browser_info.get(url) or {}
             upstreams.append(
                 {
                     "url": url,
@@ -142,6 +178,9 @@ class LoadBalancedClient:
                     "probability": probs[url],
                     "pick_count": self._request_counts.get(url, 0),
                     "outcomes": outcomes,
+                    "recycle_every": info.get("recycle_every"),
+                    "requests_since_recycle": info.get("requests_since_recycle"),
+                    "recycle_count": info.get("recycle_count"),
                 }
             )
         return {
@@ -160,7 +199,8 @@ class LoadBalancedClient:
         successes = max(0, min(h, int(successes)))
         failures = h - successes
         self._outcomes[url] = deque(
-            [False] * failures + [True] * successes,
+            [_synthetic_outcome(False, error="seeded") for _ in range(failures)]
+            + [_synthetic_outcome(True, error="seeded") for _ in range(successes)],
             maxlen=h,
         )
 
@@ -237,8 +277,73 @@ class LoadBalancedClient:
             return random.choice(self._urls)
         return random.choices(self._urls, weights=weights, k=1)[0]
 
-    def _record_outcome(self, url: str, success: bool) -> None:
-        self._outcomes[url].append(success)
+    def _record_outcome(
+        self,
+        url: str,
+        *,
+        ok: bool,
+        duration_s: float | None,
+        error: str | None = None,
+    ) -> None:
+        self._outcomes[url].append(
+            AttemptOutcome(ok=ok, duration_s=duration_s, error=error)
+        )
+
+    def _remember_browser_info(self, url: str, response: httpx.Response) -> None:
+        headers = response.headers
+        info = self._browser_info.setdefault(url, {})
+        every = headers.get(HEADER_RECYCLE_EVERY)
+        since = headers.get(HEADER_REQUESTS_SINCE_RECYCLE)
+        count = headers.get(HEADER_RECYCLE_COUNT)
+        if every is not None:
+            try:
+                info["recycle_every"] = int(every)
+            except ValueError:
+                pass
+        if since is not None:
+            try:
+                info["requests_since_recycle"] = int(since)
+            except ValueError:
+                pass
+        if count is not None:
+            try:
+                info["recycle_count"] = int(count)
+            except ValueError:
+                pass
+
+    def _apply_browser_metrics(self, url: str, metrics: dict) -> None:
+        info = self._browser_info.setdefault(url, {})
+        for key in ("recycle_every", "requests_since_recycle", "recycle_count"):
+            if key in metrics and metrics[key] is not None:
+                info[key] = int(metrics[key])
+
+    async def set_recycle_every(self, url: str, recycle_every: int) -> dict:
+        """Tell one worker to recycle Chromium every ``recycle_every`` scrapes."""
+        if url not in self._clients:
+            raise KeyError(f"unknown upstream: {url}")
+        n = int(recycle_every)
+        if n < 1:
+            raise ValueError("recycle_every must be >= 1")
+        client = self._clients[url]
+        response = await client.post(
+            "/browser/recycle-every",
+            json={"recycle_every": n},
+        )
+        response.raise_for_status()
+        try:
+            payload = response.json()
+        except Exception:
+            payload = {}
+        browser = payload.get("browser") if isinstance(payload, dict) else None
+        if isinstance(browser, dict):
+            self._apply_browser_metrics(url, browser)
+        else:
+            self._remember_browser_info(url, response)
+        self._browser_info.setdefault(url, {})["recycle_every"] = n
+        logger.info("Set upstream %s recycle_every=%d", url, n)
+        result = self.stats()
+        result["recycle_updated"] = {"url": url, "recycle_every": n}
+        return result
 
     def _log_distribution(self):
         if self._total_requests == 0:
@@ -293,14 +398,23 @@ class LoadBalancedClient:
         if self._total_requests % self._LOG_INTERVAL == 0:
             self._log_distribution()
 
+        started = time.perf_counter()
         try:
             response = await client.get(path, params=params)
+            duration_s = time.perf_counter() - started
             response.raise_for_status()
-            self._record_outcome(url, True)
+            self._record_outcome(url, ok=True, duration_s=duration_s)
+            self._remember_browser_info(url, response)
             logger.info("Proxy using upstream %s for %s", url, path)
             return response, url
         except Exception as exc:
-            self._record_outcome(url, False)
+            duration_s = time.perf_counter() - started
+            self._record_outcome(
+                url,
+                ok=False,
+                duration_s=duration_s,
+                error=str(exc) or type(exc).__name__,
+            )
             logger.warning("Upstream %s failed for %s: %s", url, path, exc)
             raise
 
