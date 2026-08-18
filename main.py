@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 from config import settings
 from database import init_db
 from image_worker import ImageWorker
-from routers import inserate, inserat, inserate_detailed
+from routers import inserate, inserat, inserate_detailed, seller
 from upstream import LoadBalancedClient
 
 logging.basicConfig(level=logging.INFO)
@@ -47,6 +47,7 @@ app = FastAPI(title="Kleinanzeigen Proxy", version="1.0.0", lifespan=lifespan)
 app.include_router(inserate.router)
 app.include_router(inserat.router)
 app.include_router(inserate_detailed.router)
+app.include_router(seller.router)
 
 
 @app.get("/")
@@ -59,6 +60,7 @@ async def root():
             "/inserat/{id}",
             "/inserate-detailed",
             "/inserate-detailed-cached",
+            "/seller/{user_id}",
             "/upstream-stats",
             "/upstream-seed",
             "/upstream-weight",

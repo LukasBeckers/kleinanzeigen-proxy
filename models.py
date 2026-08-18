@@ -25,10 +25,12 @@ class Listing(Base):
     current_version_id = Column(Text, ForeignKey("listing_versions.id"), nullable=True)
     # Denormalized: True when current_version_id points at a full detail snapshot.
     has_detail = Column(Boolean, nullable=False, default=False, index=True)
+    seller_id = Column(Text, ForeignKey("sellers.id"), nullable=True, index=True)
 
     versions = relationship("ListingVersion", back_populates="listing", foreign_keys="ListingVersion.listing_id")
     current_version = relationship("ListingVersion", foreign_keys=[current_version_id], post_update=True)
     images = relationship("Image", back_populates="listing")
+    seller = relationship("Seller", foreign_keys=[seller_id])
 
 
 class ListingVersion(Base):
@@ -67,6 +69,47 @@ class ListingVersion(Base):
 
     listing = relationship("Listing", back_populates="versions", foreign_keys=[listing_id])
     images = relationship("Image", back_populates="version")
+
+
+class Seller(Base):
+    __tablename__ = "sellers"
+
+    id = Column(Text, primary_key=True, default=new_uuid)
+    user_id = Column(Text, unique=True, nullable=False, index=True)
+    first_seen_at = Column(DateTime, default=utcnow)
+    last_seen_at = Column(DateTime, default=utcnow, onupdate=utcnow)
+    current_version_id = Column(Text, ForeignKey("seller_versions.id"), nullable=True)
+    has_profile = Column(Boolean, nullable=False, default=False, index=True)
+
+    versions = relationship(
+        "SellerVersion", back_populates="seller", foreign_keys="SellerVersion.seller_id"
+    )
+    current_version = relationship("SellerVersion", foreign_keys=[current_version_id], post_update=True)
+
+
+class SellerVersion(Base):
+    __tablename__ = "seller_versions"
+
+    id = Column(Text, primary_key=True, default=new_uuid)
+    seller_id = Column(Text, ForeignKey("sellers.id"), nullable=False, index=True)
+    fetched_at = Column(DateTime, default=utcnow)
+
+    name = Column(Text)
+    type = Column(Text)
+    since = Column(Text)
+    badges = Column(Text)  # JSON
+    url = Column(Text)
+    shop_url = Column(Text)
+    response_time = Column(Text)
+    response_time_hours = Column(Integer)
+    followers = Column(Integer)
+    ads_online = Column(Integer)
+    ads_total = Column(Integer)
+    extra = Column(Text)  # JSON
+    data_hash = Column(Text, index=True)
+    is_profile = Column(Boolean, nullable=False, default=False, index=True)
+
+    seller = relationship("Seller", back_populates="versions", foreign_keys=[seller_id])
 
 
 class Image(Base):

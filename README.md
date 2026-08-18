@@ -9,19 +9,20 @@ A transparent proxy and archival service for the [ebay-kleinanzeigen-api](https:
 - **Change Tracking** - Each listing gets a new version only when its content actually changes (hash-based deduplication). View count changes alone don't trigger new versions.
 - **Image Archival** - Images are downloaded asynchronously in the background and stored on disk, referenced back to the listing and version that introduced them.
 - **Crash Recovery** - Pending image downloads are re-enqueued on startup.
+- **Seller archive** - First-class `sellers` rows keyed by Kleinanzeigen `userId`. A listing stores `seller_id`. The profile page is scraped **once** (`GET /seller/{userId}` or automatically when a listing with a new seller is archived) and then served from cache.
 
 ## Architecture
 
 ```
 Client  ──▶  Proxy (:8001)  ──▶  kleinanzeigen-api (:8000)  ──▶  kleinanzeigen.de
                 │
-                ├── SQLite (listings, versions, images metadata)
+                ├── SQLite (listings, sellers, versions, images metadata)
                 └── /data/images/ (downloaded image files)
 ```
 
 ### Database Schema
 
-Three tables form the storage layer:
+Five tables form the storage layer:
 
 **`listings`** - Stable anchor per Kleinanzeigen ad. One row per unique `adid`, never duplicated.
 
@@ -33,6 +34,7 @@ Three tables form the storage layer:
 | `last_seen_at` | DATETIME | Updated on every fetch (even without changes) |
 | `current_version_id` | TEXT (FK) | Points to the latest version |
 | `has_detail` | BOOLEAN | True when `current_version_id` is a full detail snapshot (not search-card only) |
+| `seller_id` | TEXT (FK) | References `sellers.id` when the listing named a `userId` |
 
 **`listing_versions`** - A new row is created only when listing content changes.
 
@@ -54,11 +56,32 @@ Three tables form the storage layer:
 | `categories` | TEXT (JSON) | Category breadcrumbs |
 | `details` | TEXT (JSON) | Structured attributes (e.g., Marke, Hubraum) |
 | `features` | TEXT (JSON) | Feature tags |
-| `seller` | TEXT (JSON) | Seller info (name, type, badges) |
+| `seller` | TEXT (JSON) | Sidebar seller snapshot at fetch time (name, type, badges, userId) |
 | `extra_info` | TEXT (JSON) | Additional metadata |
 | `image_urls` | TEXT (JSON) | Original image URLs at time of fetch |
 | `data_hash` | TEXT | SHA256 hash for deduplication |
 | `is_detail` | BOOLEAN | True when this version came from a full `/inserat/{id}` (or equivalent) fetch |
+
+**`sellers`** - One row per Kleinanzeigen `userId`.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | TEXT (UUID) | Proxy primary key |
+| `user_id` | TEXT | Kleinanzeigen numeric user id |
+| `first_seen_at` / `last_seen_at` | DATETIME | First / last encounter |
+| `current_version_id` | TEXT (FK) | Latest `seller_versions` row |
+| `has_profile` | BOOLEAN | True after a `/seller/{id}` profile scrape (not just listing-sidebar data) |
+
+**`seller_versions`** - New row when profile content changes. Listing-sidebar snapshots never overwrite a stored profile.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `name` / `type` / `since` | TEXT | Display name, `private`/`business`, member-since date |
+| `badges` | TEXT (JSON) | e.g. TOP Zufriedenheit |
+| `url` / `shop_url` | TEXT | Bestandsliste and optional `/pro/` shop |
+| `response_time` / `response_time_hours` | TEXT / INT | “Antwortet in der Regel innerhalb von N Stunden” |
+| `followers` / `ads_online` / `ads_total` | INTEGER | Profile / shop counts |
+| `is_profile` | BOOLEAN | True when this version came from `/seller/{id}` |
 
 **`images`** - One row per downloaded image file.
 
@@ -229,7 +252,15 @@ Fetch detailed information for a single listing. Triggers background image downl
 curl "http://localhost:8001/inserat/3382586410"
 ```
 
-Returns full details including title, description, price, location, seller info, images, and more.
+Returns full details including title, description, price, location, seller info, images, and more. When the listing names a seller `userId` that has not been profile-scraped yet, the proxy also calls upstream `GET /seller/{userId}` once and attaches the full profile to `data.seller`.
+
+### `GET /seller/{user_id}` - Seller profile (cached)
+
+Cache-first. First request scrapes the public profile via the upstream API; later requests return the stored snapshot (`X-Seller-Cache: hit`) and do not hit Playwright again.
+
+```bash
+curl "http://localhost:8001/seller/1"
+```
 
 ### `GET /inserate-detailed` - Search with full details
 
