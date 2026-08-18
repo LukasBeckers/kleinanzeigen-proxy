@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models import Listing, ListingVersion, new_uuid, utcnow
+from models import Listing, ListingVersion, Seller, SellerVersion, new_uuid, utcnow
 
 
 def _source_is_detail(source: str) -> bool:
@@ -109,6 +109,208 @@ def _compute_hash(fields: dict) -> str:
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
+def _seller_user_id(data: dict | None) -> str | None:
+    if not isinstance(data, dict):
+        return None
+    raw = data.get("id") or data.get("user_id")
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    return text or None
+
+
+def _extract_seller_fields(data: dict) -> dict:
+    badges = data.get("badges") or []
+    extra = {
+        k: v
+        for k, v in data.items()
+        if k
+        not in {
+            "id",
+            "user_id",
+            "name",
+            "type",
+            "since",
+            "badges",
+            "url",
+            "shop_url",
+            "response_time",
+            "response_time_hours",
+            "followers",
+            "ads_online",
+            "ads_total",
+        }
+    }
+    return {
+        "name": data.get("name"),
+        "type": data.get("type") or "private",
+        "since": data.get("since"),
+        "badges": json.dumps(badges, ensure_ascii=False) if badges else None,
+        "url": data.get("url"),
+        "shop_url": data.get("shop_url"),
+        "response_time": data.get("response_time"),
+        "response_time_hours": data.get("response_time_hours"),
+        "followers": data.get("followers"),
+        "ads_online": data.get("ads_online"),
+        "ads_total": data.get("ads_total"),
+        "extra": json.dumps(extra, ensure_ascii=False) if extra else None,
+    }
+
+
+def seller_to_dict(seller: Seller, version: SellerVersion) -> dict:
+    return {
+        "id": seller.user_id,
+        "user_id": seller.user_id,
+        "name": version.name,
+        "type": version.type or "private",
+        "since": version.since,
+        "badges": _json_or([], version.badges),
+        "url": version.url
+        or f"https://www.kleinanzeigen.de/s-bestandsliste.html?userId={seller.user_id}",
+        "shop_url": version.shop_url,
+        "response_time": version.response_time,
+        "response_time_hours": version.response_time_hours,
+        "followers": version.followers,
+        "ads_online": version.ads_online,
+        "ads_total": version.ads_total,
+    }
+
+
+async def store_seller(
+    session: AsyncSession, data: dict, source: str
+) -> tuple[str | None, str | None, bool]:
+    """Upsert a seller. ``source`` is ``profile`` or ``listing``.
+
+    A listing-sidebar snapshot never overwrites a stored profile scrape.
+    """
+    user_id = _seller_user_id(data)
+    if not user_id:
+        return None, None, False
+
+    is_profile = source == "profile"
+    fields = _extract_seller_fields(data)
+    data_hash = _compute_hash(fields)
+    now = utcnow()
+
+    result = await session.execute(select(Seller).where(Seller.user_id == user_id))
+    seller = result.scalar_one_or_none()
+
+    if seller is None:
+        seller_id = new_uuid()
+        version_id = new_uuid()
+        insert_stmt = (
+            sqlite_insert(Seller)
+            .values(
+                id=seller_id,
+                user_id=user_id,
+                first_seen_at=now,
+                last_seen_at=now,
+                current_version_id=version_id,
+                has_profile=is_profile,
+            )
+            .on_conflict_do_nothing(index_elements=["user_id"])
+        )
+        insert_result = await session.execute(insert_stmt)
+        if insert_result.rowcount:
+            session.add(
+                SellerVersion(
+                    id=version_id,
+                    seller_id=seller_id,
+                    fetched_at=now,
+                    data_hash=data_hash,
+                    is_profile=is_profile,
+                    **fields,
+                )
+            )
+            await session.flush()
+            return seller_id, version_id, True
+
+        result = await session.execute(select(Seller).where(Seller.user_id == user_id))
+        seller = result.scalar_one_or_none()
+        if seller is None:
+            raise RuntimeError(f"seller insert conflict for user_id={user_id} but row missing")
+
+    seller.last_seen_at = now
+
+    if seller.has_profile and not is_profile:
+        await session.flush()
+        return seller.id, None, False
+
+    if seller.current_version_id:
+        result = await session.execute(
+            select(SellerVersion.data_hash).where(
+                SellerVersion.id == seller.current_version_id
+            )
+        )
+        current_hash = result.scalar_one_or_none()
+        if current_hash == data_hash:
+            if is_profile:
+                seller.has_profile = True
+            await session.flush()
+            return seller.id, None, False
+
+    version_id = new_uuid()
+    session.add(
+        SellerVersion(
+            id=version_id,
+            seller_id=seller.id,
+            fetched_at=now,
+            data_hash=data_hash,
+            is_profile=is_profile,
+            **fields,
+        )
+    )
+    seller.current_version_id = version_id
+    if is_profile:
+        seller.has_profile = True
+    await session.flush()
+    return seller.id, version_id, True
+
+
+async def enrich_listing_seller(session: AsyncSession, listing_data: dict) -> dict:
+    """Replace a listing's seller blob with the cached profile when we have one."""
+    seller = listing_data.get("seller") or {}
+    user_id = _seller_user_id(seller)
+    if not user_id:
+        return listing_data
+    cached = await get_cached_seller(session, user_id)
+    if cached is None:
+        return listing_data
+    out = dict(listing_data)
+    out["seller"] = cached
+    return out
+
+
+async def get_cached_seller(session: AsyncSession, user_id: str) -> dict | None:
+    """Return the profile snapshot if we already scraped this seller."""
+    result = await session.execute(select(Seller).where(Seller.user_id == str(user_id)))
+    seller = result.scalar_one_or_none()
+    if seller is None or not seller.has_profile or seller.current_version_id is None:
+        return None
+    result = await session.execute(
+        select(SellerVersion).where(SellerVersion.id == seller.current_version_id)
+    )
+    version = result.scalar_one_or_none()
+    if version is None:
+        return None
+    return seller_to_dict(seller, version)
+
+
+async def _link_listing_seller(
+    session: AsyncSession, listing: Listing, data: dict, source: str
+) -> None:
+    seller_data = data.get("seller")
+    if source == "combined":
+        details = data.get("details") or {}
+        if isinstance(details, dict) and details.get("seller"):
+            seller_data = details["seller"]
+    if not isinstance(seller_data, dict):
+        return
+    sid, _, _ = await store_seller(session, seller_data, source="listing")
+    if sid:
+        listing.seller_id = sid
+
+
 async def store_listing(
     session: AsyncSession, data: dict, source: str
 ) -> tuple[str, str | None, bool, list[str]]:
@@ -161,6 +363,9 @@ async def store_listing(
             )
             session.add(version)
             await session.flush()
+            created = await session.get(Listing, listing_id)
+            if created is not None:
+                await _link_listing_seller(session, created, data, source)
             return listing_id, version_id, True, image_urls
 
         result = await session.execute(select(Listing).where(Listing.adid == adid))
@@ -181,6 +386,7 @@ async def store_listing(
 
         if current_hash == data_hash:
             # No change
+            await _link_listing_seller(session, listing, data, source)
             await session.flush()
             return listing.id, None, False, image_urls
 
@@ -197,6 +403,7 @@ async def store_listing(
     listing.current_version_id = version_id
     listing.has_detail = is_detail
     session.add(version)
+    await _link_listing_seller(session, listing, data, source)
     await session.flush()
     return listing.id, version_id, True, image_urls
 
@@ -274,3 +481,4 @@ async def get_cached_detail(session: AsyncSession, adid: str) -> dict | None:
         "seller": _json_or({}, v.seller),
         "extra_info": _json_or({}, v.extra_info),
     }
+    return await enrich_listing_seller(session, payload)

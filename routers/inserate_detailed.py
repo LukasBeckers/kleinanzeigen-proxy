@@ -5,6 +5,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 import database as db_module
+from routers.seller import ensure_seller_profile
 from storage import get_cached_detail, store_listing, store_listings_batch
 
 logger = logging.getLogger(__name__)
@@ -78,6 +79,13 @@ async def get_inserate_detailed(
                     await image_worker.create_pending_records(
                         session, listing_id, version_id, image_urls
                     )
+            for item in data["data"]:
+                details = item.get("details") if isinstance(item, dict) else None
+                seller = (details or item or {}).get("seller") if isinstance(details or item, dict) else None
+                if isinstance(seller, dict):
+                    uid = seller.get("id") or seller.get("user_id")
+                    if uid:
+                        await ensure_seller_profile(client, session, str(uid))
             await session.commit()
 
             for adid, listing_id, version_id, image_urls in results:
@@ -251,6 +259,14 @@ async def get_inserate_detailed_cached(
                     await image_worker.create_pending_records(
                         session, lid, version_id, image_urls
                     )
+                seller = detail.get("seller") if isinstance(detail, dict) else None
+                if isinstance(seller, dict):
+                    uid = seller.get("id") or seller.get("user_id")
+                    if uid:
+                        profile = await ensure_seller_profile(client, session, str(uid))
+                        if profile:
+                            detail = dict(detail)
+                            detail["seller"] = profile
 
                 row = {
                     "adid": str(card.get("adid")),

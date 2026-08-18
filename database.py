@@ -73,9 +73,20 @@ def _migrate_detail_flags(sync_conn) -> None:
             )
 
 
+def _migrate_seller_fk(sync_conn) -> None:
+    inspector = inspect(sync_conn)
+    if not inspector.has_table("listings"):
+        return
+    l_cols = {c["name"] for c in inspector.get_columns("listings")}
+    if "seller_id" not in l_cols:
+        sync_conn.execute(text("ALTER TABLE listings ADD COLUMN seller_id TEXT"))
+        sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_listings_seller_id ON listings (seller_id)"))
+
+
 async def init_db():
     import models  # noqa: F401 — register ORM tables on Base.metadata
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(_migrate_detail_flags)
+        await conn.run_sync(_migrate_seller_fk)
