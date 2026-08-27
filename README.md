@@ -124,6 +124,7 @@ Multiple upstream API workers can be configured via `API_BASE_URLS` (comma-separ
   Example: both workers fully healthy, weights `1.5` and `1` → P = 60% / 40%.
 - On startup each upstream's window is pre-filled with successes (optimistic prior) so traffic starts evenly split (~50/50 for two workers with equal weights) until real failures displace them.
 - Connect timeout is **10s** (fail fast on offline hosts); read/write still use the full scrape budget (default 300s).
+- If a worker’s fail rate in the window **exceeds** `max_fail_rate` (default **25%**), it is taken out of the pick pool for `cooldown_s` (default **3600s / 1h**). On cooldown end the window is reseeded to all-success so it is not immediately tripped again. If every worker is in cooldown, the proxy returns **HTTP 503**. Configure at boot via `UPSTREAM_MAX_FAIL_RATE` / `UPSTREAM_COOLDOWN_S`, or at runtime via `GET`/`PATCH /upstream-settings` (hunter Admin).
 - A long failure run can push a worker to **0% pick probability**. Admins can reseed its sliding window to a chosen **success rate** — see `POST /upstream-seed` and the hunter Admin page (5% steps).
 - Weights default to `1` each. Set at boot via `API_BASE_WEIGHTS` (comma-separated, same order as URLs) or at runtime via `POST /upstream-weight` / the Admin UI.
 
@@ -158,11 +159,21 @@ Response shape:
       "weight": 1.5,
       "probability": 0.66,
       "pick_count": 28,
-      "outcomes": [true, true, false]
+      "recycle_every": 10000,
+      "requests_since_recycle": 12,
+      "recycle_count": 3,
+      "outcomes": [
+        {"ok": true, "duration_s": 1.24, "error": null},
+        {"ok": false, "duration_s": 12.4, "error": "ReadTimeout"}
+      ]
     }
   ]
 }
 ```
+
+`outcomes` is oldest → newest. `duration_s` / `error` are `null` for synthetic
+slots (optimistic prior or admin seed). Recycle fields come from the worker's
+`X-Recycle-*` response headers (or the last `POST /upstream-recycle`).
 
 ### Admin: reseed window success rate
 
@@ -190,15 +201,31 @@ The proxy will be available at `http://localhost:8001`.
 
 ## API Endpoints
 
-Most endpoints mirror the upstream API and return identical responses. Operational endpoints (`/`, `/upstream-stats`, `/upstream-seed`) are proxy-only.
+Most endpoints mirror the upstream API and return identical responses. Operational endpoints (`/`, `/upstream-stats`, `/upstream-seed`, `/upstream-settings`) are proxy-only.
 
 ### `GET /upstream-stats` - Load-balancer window + probabilities
 
-Returns the rolling success/failure window and current pick probability for every configured upstream worker. See the load-balancing section above for field definitions.
+Returns the rolling success/failure window and current pick probability for every configured upstream worker. See the load-balancing section above for field definitions. Also includes `max_fail_rate`, `cooldown_s`, and per-worker `disabled` / `disabled_until`.
+
+### `GET` / `PATCH /upstream-settings` - Fail-rate trip + cooldown
+
+Body (PATCH): `{ "max_fail_rate": 0.25, "cooldown_s": 3600 }`. Either field may be omitted. Runtime only.
 
 ### `POST /upstream-seed` - Reseed one worker's window success rate
 
 Body: `{ "url": "<exact upstream base URL>", "success_rate": 0.80 }` with `success_rate` in 5% steps (0 = all fail, 1 = all success). Rewrites only that worker's sliding window. See the load-balancing section above.
+
+### `POST /upstream-recycle` - Set one worker's Chromium recycle interval
+
+Body: `{ "url": "<exact upstream base URL>", "recycle_every": 500 }` with
+`recycle_every >= 1`. Forwards to that worker's `POST /browser/recycle-every`.
+Runtime only; does not rewrite the worker's env.
+
+```bash
+curl -X POST http://localhost:8001/upstream-recycle \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"http://100.68.101.87:8001","recycle_every":500}'
+```
 
 ### `POST /upstream-weight` - Set multiplicative pick weight
 

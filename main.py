@@ -1,14 +1,16 @@
 import logging
 from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from config import settings
 from database import init_db
 from image_worker import ImageWorker
 from routers import inserate, inserat, inserate_detailed
-from upstream import LoadBalancedClient
+from upstream import LoadBalancedClient, NoEligibleUpstream
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -28,7 +30,11 @@ async def lifespan(app: FastAPI):
     logger.info("Database initialized")
 
     app.state.upstream_client = LoadBalancedClient(
-        urls, timeout=300.0, weights=weights
+        urls,
+        timeout=300.0,
+        weights=weights,
+        max_fail_rate=settings.max_fail_rate,
+        cooldown_s=settings.cooldown_s,
     )
 
     app.state.image_worker = ImageWorker()
@@ -43,6 +49,12 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Kleinanzeigen Proxy", version="1.0.0", lifespan=lifespan)
+
+
+@app.exception_handler(NoEligibleUpstream)
+async def _no_eligible_upstream(_request: Request, exc: NoEligibleUpstream):
+    return JSONResponse(status_code=503, content={"detail": str(exc)})
+
 
 app.include_router(inserate.router)
 app.include_router(inserat.router)
@@ -62,6 +74,8 @@ async def root():
             "/upstream-stats",
             "/upstream-seed",
             "/upstream-weight",
+            "/upstream-recycle",
+            "/upstream-settings",
         ],
     }
 
@@ -135,3 +149,80 @@ async def upstream_weight(body: UpstreamWeightBody, request: Request):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+class UpstreamRecycleBody(BaseModel):
+    url: str = Field(..., min_length=1, description="Exact upstream base URL")
+    recycle_every: int = Field(
+        ...,
+        ge=1,
+        description="Recycle Playwright Chromium after this many scrape operations",
+    )
+
+
+@app.post("/upstream-recycle")
+async def upstream_recycle(body: UpstreamRecycleBody, request: Request):
+    """Set one worker's Chromium recycle interval (scrape-count, not a timer).
+
+    Forwards to that worker's ``POST /browser/recycle-every``. Runtime only;
+    does not rewrite the worker's ``BROWSER_RECYCLE_EVERY`` env.
+    """
+    client: LoadBalancedClient = request.app.state.upstream_client
+    try:
+        return await client.set_recycle_every(body.url, body.recycle_every)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"worker {body.url} unreachable or rejected recycle update: {exc}",
+        ) from exc
+
+
+class UpstreamSettingsBody(BaseModel):
+    max_fail_rate: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Trip a worker when its window fail rate exceeds this (default 0.25)",
+    )
+    cooldown_s: float | None = Field(
+        default=None,
+        ge=1,
+        description="Seconds a tripped worker stays out of the pick pool (default 3600)",
+    )
+
+
+@app.get("/upstream-settings")
+async def get_upstream_settings(request: Request):
+    """Fail-rate trip + cooldown used by the load balancer."""
+    client: LoadBalancedClient = request.app.state.upstream_client
+    snap = client.stats()
+    return {
+        "max_fail_rate": snap["max_fail_rate"],
+        "cooldown_s": snap["cooldown_s"],
+    }
+
+
+@app.patch("/upstream-settings")
+async def patch_upstream_settings(body: UpstreamSettingsBody, request: Request):
+    """Update fail-rate trip and/or cooldown. Runtime only; not env."""
+    if body.max_fail_rate is None and body.cooldown_s is None:
+        raise HTTPException(
+            status_code=400, detail="provide max_fail_rate and/or cooldown_s"
+        )
+    client: LoadBalancedClient = request.app.state.upstream_client
+    try:
+        snap = client.set_circuit(
+            max_fail_rate=body.max_fail_rate,
+            cooldown_s=body.cooldown_s,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "max_fail_rate": snap["max_fail_rate"],
+        "cooldown_s": snap["cooldown_s"],
+        "upstreams": snap["upstreams"],
+    }
