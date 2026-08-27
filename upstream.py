@@ -39,6 +39,14 @@ def _synthetic_outcome(ok: bool, *, error: str | None = None) -> AttemptOutcome:
     return AttemptOutcome(ok=ok, duration_s=None, error=error)
 
 
+class NoEligibleUpstream(Exception):
+    """Every worker is in a failure-rate cooldown."""
+
+
+DEFAULT_MAX_FAIL_RATE = 0.25
+DEFAULT_COOLDOWN_S = 3600.0
+
+
 class LoadBalancedClient:
     _LOG_INTERVAL = 50  # Log distribution every N requests
     _HISTORY_SIZE = 100  # Rolling window of attempts per upstream
@@ -53,6 +61,8 @@ class LoadBalancedClient:
         history_size: int = _HISTORY_SIZE,
         connect_timeout: float = _CONNECT_TIMEOUT,
         weights: list[float] | None = None,
+        max_fail_rate: float = DEFAULT_MAX_FAIL_RATE,
+        cooldown_s: float = DEFAULT_COOLDOWN_S,
     ):
         self._urls = list(urls)
         self._timeout = timeout
@@ -99,6 +109,10 @@ class LoadBalancedClient:
         self._total_requests = 0
         # Last recycle stats seen on a worker response (headers or setter).
         self._browser_info: dict[str, dict] = {url: {} for url in self._urls}
+        self._max_fail_rate = float(max_fail_rate)
+        self._cooldown_s = float(cooldown_s)
+        self._disabled_until: dict[str, float] = {url: 0.0 for url in self._urls}
+        self._validate_circuit(self._max_fail_rate, self._cooldown_s)
 
     @property
     def urls(self) -> list[str]:
@@ -114,27 +128,97 @@ class LoadBalancedClient:
         """successes × configured multiplicative weight."""
         return self._success_count(url) * self._weights[url]
 
+    @staticmethod
+    def _validate_circuit(max_fail_rate: float, cooldown_s: float) -> None:
+        if not 0.0 <= max_fail_rate <= 1.0:
+            raise ValueError("max_fail_rate must be between 0 and 1")
+        if cooldown_s < 1:
+            raise ValueError("cooldown_s must be >= 1")
+
+    def set_circuit(
+        self,
+        *,
+        max_fail_rate: float | None = None,
+        cooldown_s: float | None = None,
+    ) -> dict:
+        """Update fail-rate trip + cooldown. Runtime only."""
+        rate = self._max_fail_rate if max_fail_rate is None else float(max_fail_rate)
+        cool = self._cooldown_s if cooldown_s is None else float(cooldown_s)
+        self._validate_circuit(rate, cool)
+        self._max_fail_rate = rate
+        self._cooldown_s = cool
+        logger.info(
+            "Circuit settings max_fail_rate=%.3f cooldown_s=%.0f",
+            rate,
+            cool,
+        )
+        return self.stats()
+
+    def _is_disabled(self, url: str, *, now: float | None = None) -> bool:
+        now = time.time() if now is None else now
+        return self._disabled_until.get(url, 0.0) > now
+
+    def _expire_cooldowns(self) -> None:
+        now = time.time()
+        for url in self._urls:
+            until = self._disabled_until.get(url, 0.0)
+            if until and until <= now:
+                self._disabled_until[url] = 0.0
+                self._fill_window(url, self._history_size)
+                logger.info(
+                    "Upstream %s failure-rate cooldown ended; window reseeded",
+                    url,
+                )
+
+    def _eligible_urls(self) -> list[str]:
+        self._expire_cooldowns()
+        now = time.time()
+        return [url for url in self._urls if not self._is_disabled(url, now=now)]
+
+    def _fail_rate(self, url: str) -> float:
+        window = len(self._outcomes[url])
+        if window == 0:
+            return 0.0
+        return self._failure_count(url) / window
+
+    def _maybe_trip_circuit(self, url: str) -> None:
+        if self._is_disabled(url):
+            return
+        if self._fail_rate(url) > self._max_fail_rate:
+            until = time.time() + self._cooldown_s
+            self._disabled_until[url] = until
+            logger.warning(
+                "Upstream %s fail_rate=%.1f%% > %.1f%%; disabled for %.0fs",
+                url,
+                self._fail_rate(url) * 100,
+                self._max_fail_rate * 100,
+                self._cooldown_s,
+            )
+
+    def _probabilities_among(self, urls: list[str]) -> dict[str, float]:
+        if not urls:
+            return {}
+        scores = {url: self._weighted_score(url) for url in urls}
+        total = sum(scores.values())
+        if total > 0:
+            return {url: scores[url] / total for url in urls}
+        wsum = sum(self._weights[url] for url in urls)
+        if wsum > 0:
+            return {url: self._weights[url] / wsum for url in urls}
+        equal = 1.0 / len(urls)
+        return {url: equal for url in urls}
+
     def _probabilities(self) -> dict[str, float]:
         """Selection probabilities matching ``_pick_upstream`` weights.
 
+        Disabled (cooldown) workers get 0. Eligible workers share
         P(i) = (successes_i · weight_i) / sum_j(successes_j · weight_j).
-
-        When every upstream has zero successes, fall back to pure configured
-        weights (or equal 1/N if all weights are zero) so dashboards and
-        random.choices stay well-defined.
         """
         if not self._urls:
             return {}
-        scores = {url: self._weighted_score(url) for url in self._urls}
-        total = sum(scores.values())
-        if total > 0:
-            return {url: scores[url] / total for url in self._urls}
-        # No successes in any window — use configured weights alone.
-        wsum = sum(self._weights[url] for url in self._urls)
-        if wsum > 0:
-            return {url: self._weights[url] / wsum for url in self._urls}
-        equal = 1.0 / len(self._urls)
-        return {url: equal for url in self._urls}
+        eligible = self._eligible_urls()
+        inner = self._probabilities_among(eligible)
+        return {url: inner.get(url, 0.0) for url in self._urls}
 
     def set_weight(self, url: str, weight: float) -> dict:
         """Update the multiplicative pick weight for one upstream."""
@@ -167,6 +251,9 @@ class LoadBalancedClient:
             # Oldest first so left side of the bar is the past.
             outcomes = [o.to_json() for o in self._outcomes[url]]
             info = self._browser_info.get(url) or {}
+            until = self._disabled_until.get(url, 0.0)
+            now = time.time()
+            disabled = until > now
             upstreams.append(
                 {
                     "url": url,
@@ -181,11 +268,16 @@ class LoadBalancedClient:
                     "recycle_every": info.get("recycle_every"),
                     "requests_since_recycle": info.get("requests_since_recycle"),
                     "recycle_count": info.get("recycle_count"),
+                    "fail_rate": self._fail_rate(url),
+                    "disabled": disabled,
+                    "disabled_until": until if disabled else None,
                 }
             )
         return {
             "history_size": self._history_size,
             "total_requests": self._total_requests,
+            "max_fail_rate": self._max_fail_rate,
+            "cooldown_s": self._cooldown_s,
             "upstreams": upstreams,
         }
 
@@ -260,22 +352,20 @@ class LoadBalancedClient:
         return result
 
     def _pick_upstream(self) -> str:
-        """Weighted pick: P(i) = (successes_i · weight_i) / Σ (successes_j · weight_j).
+        """Weighted pick among workers not in failure-rate cooldown."""
+        eligible = self._eligible_urls()
+        if not eligible:
+            raise NoEligibleUpstream(
+                "all scraper workers are in a failure-rate cooldown"
+            )
+        if len(eligible) == 1:
+            return eligible[0]
 
-        Each upstream keeps the last ``history_size`` attempt outcomes
-        (success or failure). Successes contribute weight, scaled by the
-        configured multiplicative ``weight`` (default 1). Histories are
-        initialised to all-success so new proxies start even (modulo weights).
-        When every window is all-fail, pick by configured weights alone.
-        """
-        if len(self._urls) == 1:
-            return self._urls[0]
-
-        probs = self._probabilities()
-        weights = [probs[url] for url in self._urls]
+        inner = self._probabilities_among(eligible)
+        weights = [inner[url] for url in eligible]
         if sum(weights) <= 0:
-            return random.choice(self._urls)
-        return random.choices(self._urls, weights=weights, k=1)[0]
+            return random.choice(eligible)
+        return random.choices(eligible, weights=weights, k=1)[0]
 
     def _record_outcome(
         self,
@@ -288,6 +378,7 @@ class LoadBalancedClient:
         self._outcomes[url].append(
             AttemptOutcome(ok=ok, duration_s=duration_s, error=error)
         )
+        self._maybe_trip_circuit(url)
 
     def _remember_browser_info(self, url: str, response: httpx.Response) -> None:
         headers = response.headers

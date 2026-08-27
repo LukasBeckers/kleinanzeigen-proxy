@@ -3,7 +3,9 @@ import random
 import httpx
 import pytest
 
-from upstream import AttemptOutcome, LoadBalancedClient
+from collections import deque
+
+from upstream import AttemptOutcome, LoadBalancedClient, NoEligibleUpstream
 
 
 def _ok(**kwargs) -> AttemptOutcome:
@@ -141,7 +143,9 @@ class TestLoadBalancedClient:
             raise httpx.ConnectError("unreliable")
 
         urls = ["http://a:8000", "http://b:8000"]
-        client = LoadBalancedClient(urls, timeout=1.0, history_size=100)
+        client = LoadBalancedClient(
+            urls, timeout=1.0, history_size=100, max_fail_rate=1.0
+        )
         client._clients["http://a:8000"] = httpx.AsyncClient(
             base_url="http://a:8000",
             transport=httpx.MockTransport(handler_a),
@@ -460,6 +464,75 @@ class TestLoadBalancedClient:
         assert row["requests_since_recycle"] == 12
         assert row["recycle_count"] == 3
         await client.aclose()
+
+    def test_circuit_trips_above_fail_rate_and_skips_worker(self):
+        client = LoadBalancedClient(
+            ["http://a:8000", "http://b:8000"],
+            timeout=1.0,
+            history_size=10,
+            max_fail_rate=0.25,
+            cooldown_s=60,
+        )
+        client._outcomes["http://a:8000"] = deque(
+            [_fail()] * 3 + [_ok()] * 7, maxlen=10
+        )
+        client._maybe_trip_circuit("http://a:8000")
+        assert client._is_disabled("http://a:8000")
+        picks = [client._pick_upstream() for _ in range(30)]
+        assert all(p == "http://b:8000" for p in picks)
+        assert client.stats()["upstreams"][0]["disabled"] is True
+
+    def test_circuit_does_not_trip_at_threshold(self):
+        client = LoadBalancedClient(
+            ["http://a:8000"],
+            timeout=1.0,
+            history_size=4,
+            max_fail_rate=0.25,
+            cooldown_s=60,
+        )
+        # 1/4 = 0.25 is allowed; trip only when strictly greater.
+        client._outcomes["http://a:8000"] = deque([_fail()] + [_ok()] * 3, maxlen=4)
+        client._maybe_trip_circuit("http://a:8000")
+        assert not client._is_disabled("http://a:8000")
+
+    def test_all_workers_in_cooldown_raises(self):
+        client = LoadBalancedClient(
+            ["http://a:8000", "http://b:8000"],
+            timeout=1.0,
+            history_size=4,
+            max_fail_rate=0.0,
+            cooldown_s=60,
+        )
+        import time as time_mod
+        now = time_mod.time()
+        client._disabled_until["http://a:8000"] = now + 60
+        client._disabled_until["http://b:8000"] = now + 60
+        with pytest.raises(NoEligibleUpstream):
+            client._pick_upstream()
+
+    def test_cooldown_expiry_reseeds_window(self):
+        client = LoadBalancedClient(
+            ["http://a:8000"],
+            timeout=1.0,
+            history_size=8,
+            max_fail_rate=0.25,
+            cooldown_s=60,
+        )
+        client._outcomes["http://a:8000"] = deque([_fail()] * 8, maxlen=8)
+        client._disabled_until["http://a:8000"] = 1.0  # already expired
+        client._expire_cooldowns()
+        assert not client._is_disabled("http://a:8000")
+        assert client._success_count("http://a:8000") == 8
+
+    def test_set_circuit_validates_and_updates(self):
+        client = LoadBalancedClient(["http://a:8000"], timeout=1.0)
+        snap = client.set_circuit(max_fail_rate=0.4, cooldown_s=120)
+        assert snap["max_fail_rate"] == 0.4
+        assert snap["cooldown_s"] == 120
+        with pytest.raises(ValueError):
+            client.set_circuit(max_fail_rate=1.5)
+        with pytest.raises(ValueError):
+            client.set_circuit(cooldown_s=0)
 
     @pytest.mark.asyncio
     async def test_set_recycle_every_posts_to_worker(self):

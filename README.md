@@ -124,6 +124,7 @@ Multiple upstream API workers can be configured via `API_BASE_URLS` (comma-separ
   Example: both workers fully healthy, weights `1.5` and `1` → P = 60% / 40%.
 - On startup each upstream's window is pre-filled with successes (optimistic prior) so traffic starts evenly split (~50/50 for two workers with equal weights) until real failures displace them.
 - Connect timeout is **10s** (fail fast on offline hosts); read/write still use the full scrape budget (default 300s).
+- If a worker’s fail rate in the window **exceeds** `max_fail_rate` (default **25%**), it is taken out of the pick pool for `cooldown_s` (default **3600s / 1h**). On cooldown end the window is reseeded to all-success so it is not immediately tripped again. If every worker is in cooldown, the proxy returns **HTTP 503**. Configure at boot via `UPSTREAM_MAX_FAIL_RATE` / `UPSTREAM_COOLDOWN_S`, or at runtime via `GET`/`PATCH /upstream-settings` (hunter Admin).
 - A long failure run can push a worker to **0% pick probability**. Admins can reseed its sliding window to a chosen **success rate** — see `POST /upstream-seed` and the hunter Admin page (5% steps).
 - Weights default to `1` each. Set at boot via `API_BASE_WEIGHTS` (comma-separated, same order as URLs) or at runtime via `POST /upstream-weight` / the Admin UI.
 
@@ -200,11 +201,15 @@ The proxy will be available at `http://localhost:8001`.
 
 ## API Endpoints
 
-Most endpoints mirror the upstream API and return identical responses. Operational endpoints (`/`, `/upstream-stats`, `/upstream-seed`) are proxy-only.
+Most endpoints mirror the upstream API and return identical responses. Operational endpoints (`/`, `/upstream-stats`, `/upstream-seed`, `/upstream-settings`) are proxy-only.
 
 ### `GET /upstream-stats` - Load-balancer window + probabilities
 
-Returns the rolling success/failure window and current pick probability for every configured upstream worker. See the load-balancing section above for field definitions.
+Returns the rolling success/failure window and current pick probability for every configured upstream worker. See the load-balancing section above for field definitions. Also includes `max_fail_rate`, `cooldown_s`, and per-worker `disabled` / `disabled_until`.
+
+### `GET` / `PATCH /upstream-settings` - Fail-rate trip + cooldown
+
+Body (PATCH): `{ "max_fail_rate": 0.25, "cooldown_s": 3600 }`. Either field may be omitted. Runtime only.
 
 ### `POST /upstream-seed` - Reseed one worker's window success rate
 

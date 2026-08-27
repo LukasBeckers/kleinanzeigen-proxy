@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     database_url: str = "sqlite+aiosqlite:////data/proxy.db"
     image_storage_path: str = "/data/images"
     image_download_concurrency: int = 5
+    max_fail_rate: float = Field(0.25, alias="UPSTREAM_MAX_FAIL_RATE")
+    cooldown_s: float = Field(3600.0, alias="UPSTREAM_COOLDOWN_S")
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
