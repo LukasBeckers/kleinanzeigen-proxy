@@ -95,7 +95,7 @@ Concurrent cache misses for the same `adid` (e.g. several hunter jobs finishing 
 
 ```bash
 git clone https://github.com/LukasBeckers/kleinanzeigen-proxy.git
-cd kleinanzeigen-proxy
+cd ~/Projects/kleinanzeigen-proxy
 ```
 
 ### 2. Configure the environment
