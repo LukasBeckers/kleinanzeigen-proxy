@@ -202,6 +202,37 @@ class TestCachedEndpoint:
         assert router.inserat_calls == 1
 
 
+class TestDetailFetchConcurrency:
+    async def test_cold_details_overlap(self, client):
+        """A cold page must not fetch details one-by-one.
+
+        Sequential fetches of a full page ran past the 60s source-client
+        timeout, so the hunter recorded ReadTimeout and zero listings.
+        """
+        import asyncio
+
+        from main import app
+
+        state = {"inflight": 0, "max": 0}
+
+        class _SlowUpstream:
+            async def get(self, path, *, params=None):
+                if str(path).startswith("/inserat/"):
+                    state["inflight"] += 1
+                    state["max"] = max(state["max"], state["inflight"])
+                    await asyncio.sleep(0.05)
+                    state["inflight"] -= 1
+                    adid = str(path).rsplit("/", 1)[-1]
+                    return _detail_response(adid), "http://mock-upstream"
+                return _search_response(["P1", "P2", "P3", "P4"]), "http://mock-upstream"
+
+        app.state.upstream_client = _SlowUpstream()
+        r = await client.get("/inserate-detailed-cached", params={"query": "simson"})
+        body = r.json()
+        assert body["unique_results"] == 4
+        assert state["max"] >= 2
+
+
 class TestCachedEndpointDiagnostics:
     """Tests for the new diagnostic fields added to /inserate-detailed-cached."""
 

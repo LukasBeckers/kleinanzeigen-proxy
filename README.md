@@ -284,6 +284,8 @@ The JSON body includes `performance_metrics` with `cache_hits`, `cache_misses`, 
 
 Detail cache hits require `listings.has_detail = true` (current version has `is_detail = true`). Search-card archival from `GET /inserate` stores versions with `is_detail = false`; only full detail fetches flip the flags. Imageless listings are cached after the first detail fetch (`image_urls = "[]"`).
 
+Cache misses are fetched five at a time. A page of new ads fetched one-by-one takes longer than the source server's 60s timeout, and the hunter then stores the run as a failure with no listings.
+
 **Note for kleinanzeigen-hunter consumers:** `cache_hits` / `cache_misses` are unrelated to hunter's `new_count`. A run can scrape 25 listings (23 cache hits, 2 misses) yet show `new_count=0` when every adid was already seen by that job's `seen_listings` dedup. Cache hits mean "detail came from proxy storage"; `new_count` means "adid not yet processed under this job's pipeline hash".
 
 ## Data Access

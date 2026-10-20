@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 
@@ -10,6 +11,11 @@ from storage import get_cached_detail, store_listing, store_listings_batch
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# A full page is ~25 uncached details. One-at-a-time that runs past the
+# source server's 60s client timeout, so the hunter records a failure and
+# shows zero listings. Five at a time keeps a cold page inside that budget.
+_DETAIL_FETCH_CONCURRENCY = 5
 
 
 def _build_search_params(
@@ -197,34 +203,37 @@ async def get_inserate_detailed_cached(
 
     to_store: list[tuple[dict, dict, str]] = []  # (card, detail, upstream_used)
 
-    for card in need_fetch:
+    async def _fetch_detail(card: dict):
         adid = str(card.get("adid") or "")
         if not adid:
-            continue
-
-        t0 = time.time()
-
+            return "skip"
         try:
-            response, upstream_used = await client.get(f"/inserat/{adid}")
-            data = response.json()
+            async with detail_slots:
+                response, upstream_used = await client.get(f"/inserat/{adid}")
+                data = response.json()
         except Exception as exc:
             logger.warning(
                 "Detail fetch failed for adid=%s (upstream=%s, error: %s)",
                 adid, "unknown", exc
             )
-            failed_details += 1
-            continue
+            return None
 
         if not data.get("success") or not data.get("data"):
             logger.warning(
                 "Detail response not successful for adid=%s (success=%s, has_data=%s)",
                 adid, data.get("success"), bool(data.get("data"))
             )
+            return None
+        return card, data["data"], upstream_used
+
+    detail_slots = asyncio.Semaphore(_DETAIL_FETCH_CONCURRENCY)
+    for outcome in await asyncio.gather(*(_fetch_detail(card) for card in need_fetch)):
+        if outcome is None:
             failed_details += 1
             continue
-
-        detail = data["data"]
-        to_store.append((card, detail, upstream_used))
+        if outcome == "skip":
+            continue
+        to_store.append(outcome)
         successful_details += 1
 
     if failed_details > 0:
