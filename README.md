@@ -367,6 +367,7 @@ kleinanzeigen-proxy/
 - **FastAPI** - Web framework
 - **httpx** - Async HTTP client for upstream communication
 - **SQLAlchemy** (async) + **aiosqlite** - Database ORM and async SQLite driver
+- **certifi** `2026.10.19` pinned in `requirements.txt` (GHSA-6q48-6c7w-9gw2)
 - **pydantic-settings** - Configuration management
 - **Docker** - Containerization with volume-based persistence
 
