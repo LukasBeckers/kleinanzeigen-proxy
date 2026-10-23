@@ -85,16 +85,17 @@ class ImageWorker:
     ) -> None:
         """Create pending image records in DB before enqueuing downloads."""
         for url in urls:
-            # Check if this image already exists for this listing
+            # One row per listing URL. A second search used to insert
+            # another pending row, and the downloader then raised
+            # MultipleResultsFound on scalar_one_or_none.
             result = await session.execute(
                 select(Image).where(
                     Image.listing_id == listing_id,
                     Image.original_url == url,
-                    Image.status == "downloaded",
                 )
             )
-            existing = result.scalar_one_or_none()
-            if existing:
+            existing = result.scalars().all()
+            if any(row.status in {"downloaded", "pending"} for row in existing):
                 continue
 
             image = Image(
@@ -129,9 +130,13 @@ class ImageWorker:
                     Image.status == "pending",
                 )
             )
-            image = result.scalar_one_or_none()
-            if not image:
+            # Duplicate pending rows for one URL are the same download.
+            # scalar_one_or_none raised MultipleResultsFound and the
+            # worker logged the URL as an error without saving the file.
+            images = list(result.scalars().all())
+            if not images:
                 return
+            image = images[0]
 
             try:
                 response = await self.client.get(job.original_url)
@@ -148,16 +153,22 @@ class ImageWorker:
                 filepath = listing_dir / filename
                 filepath.write_bytes(response.content)
 
-                image.local_path = f"{job.adid}/{filename}"
-                image.downloaded_at = datetime.now(timezone.utc)
-                image.file_size = len(response.content)
-                image.content_type = content_type.split(";")[0].strip()
-                image.status = "downloaded"
+                downloaded_at = datetime.now(timezone.utc)
+                local_path = f"{job.adid}/{filename}"
+                size = len(response.content)
+                mime = content_type.split(";")[0].strip()
+                for row in images:
+                    row.local_path = local_path
+                    row.downloaded_at = downloaded_at
+                    row.file_size = size
+                    row.content_type = mime
+                    row.status = "downloaded"
 
                 await session.commit()
-                logger.info(f"Downloaded image {job.original_url} -> {image.local_path}")
+                logger.info(f"Downloaded image {job.original_url} -> {local_path}")
 
             except Exception as e:
-                image.status = "failed"
+                for row in images:
+                    row.status = "failed"
                 await session.commit()
                 logger.error(f"Failed to download {job.original_url}: {e}")

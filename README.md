@@ -74,6 +74,8 @@ Three tables form the storage layer:
 | `content_type` | TEXT | MIME type |
 | `status` | TEXT | pending / downloaded / failed |
 
+A second pending row for the same listing and URL is not inserted. If duplicates are already stored, the download worker fetches the file once and marks every matching pending row downloaded. It does not raise when more than one pending row matches.
+
 ### Deduplication Strategy
 
 Each listing version is hashed using SHA256 over a canonical JSON of all content fields **except `views`** (which changes constantly and isn't meaningful for tracking real updates). When a listing is fetched:
